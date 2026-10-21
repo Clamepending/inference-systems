@@ -95,3 +95,25 @@ test("progress import rejects malformed roots and strips unexpected keys", () =>
   assert.equal(clean.admin, undefined);
   assert.deepEqual(clean.projects.engine, [1]);
 });
+
+test("unfinished evidence survives progress round trips without duplicate credit", () => {
+  const original = {
+    version: 1,
+    lessons: {
+      "02": {
+        complete: false,
+        checklist: [0, 0, 2, 9, "1"],
+        exercises: [1, 1, 2],
+      },
+    },
+    projects: {},
+  };
+  const restored = validateProgress(JSON.parse(JSON.stringify(original)));
+  assert.deepEqual(restored.lessons["02"].checklist, [0, 2]);
+  assert.deepEqual(restored.lessons["02"].exercises, [1, 2]);
+  assert.equal(restored.lessons["02"].complete, false);
+  assert.deepEqual(
+    validateProgress(JSON.parse(JSON.stringify(restored))),
+    restored,
+  );
+});

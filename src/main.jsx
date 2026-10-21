@@ -812,7 +812,7 @@ function Lesson({ lesson: l, state, update, notify }) {
   const [tab, setTab] = useState("article");
   const [answers, setAnswers] = useState(state.quiz?.answers || []);
   const [submitted, setSubmitted] = useState(state.quiz?.submitted || false);
-  const [checklist, setChecklist] = useState([]);
+  const checklist = state.checklist || [];
   const [showVisual, setShowVisual] = useState(false);
   if (!l)
     return (
@@ -1199,11 +1199,11 @@ function Lesson({ lesson: l, state, update, notify }) {
                   checked={checklist.includes(i) || !!state.complete}
                   disabled={state.complete}
                   onChange={() =>
-                    setChecklist(
-                      checklist.includes(i)
+                    update({
+                      checklist: checklist.includes(i)
                         ? checklist.filter((n) => n !== i)
                         : [...checklist, i],
-                    )
+                    })
                   }
                 />
                 <span>{c}</span>

@@ -13,7 +13,7 @@ worked numeric examples also received an editorial arithmetic review.
 
 ## Numerical references
 
-Six JavaScript tests cover the interactive models and progress import validation.
+Seven JavaScript tests cover the interactive models and progress import validation.
 Eight Python tests pass, including the optional PyTorch decoder test. They cover:
 
 - Byte/unit accounting and the weight/KV memory estimate.
@@ -38,14 +38,15 @@ Checked in Chromium at 1440×1000 and 390×844:
 - All 24 chapters render without math errors or runtime exceptions.
 - All six visual experiments, controls, and prediction explanations work.
 - A full lesson path: exercise checks, 5/5 quiz, evidence checklist, completion.
-- Notes and lesson/project progress persist across reloads.
+- Notes, unfinished evidence checklists, and lesson/project progress persist across reloads.
 - JSON progress export and import work.
 - Search, resource filters, Berkeley resource mappings, and mobile navigation work.
 - Fourteen representative mobile routes have no document-level horizontal overflow.
 - Light and dark theme transitions work.
 
-Production build and dependency audit pass. Public deployment verification is
-performed against the GitHub Pages URL after publication.
+Production build and dependency audit pass. The same browser checks passed against
+the deployed [GitHub Pages site](https://clamepending.github.io/inference-systems/),
+which returned HTTP 200. GitHub Actions built and deployed the published source.
 
 ## Explicit limits
 

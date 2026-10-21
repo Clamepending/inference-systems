@@ -36,7 +36,22 @@ export function validateProgress(value) {
       notes:
         typeof entry.notes === "string" ? entry.notes.slice(0, 100000) : "",
       exercises: Array.isArray(entry.exercises)
-        ? entry.exercises.filter((i) => Number.isInteger(i) && i >= 0 && i < 3)
+        ? [
+            ...new Set(
+              entry.exercises.filter(
+                (i) => Number.isInteger(i) && i >= 0 && i < 3,
+              ),
+            ),
+          ]
+        : [],
+      checklist: Array.isArray(entry.checklist)
+        ? [
+            ...new Set(
+              entry.checklist.filter(
+                (i) => Number.isInteger(i) && i >= 0 && i < 3,
+              ),
+            ),
+          ]
         : [],
     };
     if (entry.quiz && Array.isArray(entry.quiz.answers))
