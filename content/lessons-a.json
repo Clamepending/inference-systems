@@ -1,0 +1,1729 @@
+[
+  {
+    "id": "01",
+    "slug": "anatomy-of-a-token",
+    "title": "The computational anatomy of a token",
+    "subtitle": "Predict the work before you profile the work.",
+    "phase": 1,
+    "week": 1,
+    "minutes": 35,
+    "level": "Core",
+    "hardware": "CPU",
+    "tags": [
+      "cost models",
+      "prefill",
+      "decode"
+    ],
+    "outcomes": [
+      "Derive dense decoder FLOPs and weight traffic from tensor shapes.",
+      "Separate prefill, first-token production, and incremental decode.",
+      "Construct a falsifiable bottleneck prediction with explicit assumptions."
+    ],
+    "body": "## A token is a schedule of tensor operations\n\nKnowing a model's parameter count is not enough to predict its latency. You need the tensor shapes, the data that survives between steps, and the execution order. Begin with a decoder block: normalization, query/key/value projections, attention, output projection, residual updates, and an MLP. A gated MLP typically has two input projections and one output projection. The precise architecture matters; never silently substitute a textbook transformer for the checkpoint you actually run.\n\nLet the hidden width be $d$, MLP width $f$, layer count $L$, query-head count $h_q$, KV-head count $h_{kv}$, and head dimension $d_h$. For a conventional grouped-query decoder with $d=h_qd_h$, the four attention projections contain $2d^2+2d h_{kv}d_h$ weights. A gated MLP adds $3df$. Ignoring biases and normalization parameters, the block parameter count is therefore\n\n$$P_{block}=2d^2+2d h_{kv}d_h+3df.$$\n\nMultiplying a vector by these matrices costs approximately $2P_{block}$ FLOPs when a multiply and an add count separately. Embedding lookup is a memory access, while an untied vocabulary projection is a matrix multiplication; combining them into one vague “embedding cost” conceals a potentially relevant decode operation.\n\n## Why prefill and decode behave differently\n\nDuring prefill, a prompt of $S$ tokens supplies many rows to each projection. The operation resembles $[BS,d]\\,[d,f]$. During incremental decode, each active sequence usually contributes one new row, so the same operation resembles $[B,d]\\,[d,f]$. The weights are the same. Their reuse per invocation is different. Small-batch decode can move a great deal of weight data for relatively little arithmetic; a long prompt supplies enough rows to amortize those reads.\n\nCausal attention adds work that depends on context length. For one new token attending to $S$ cached positions, the score product and weighted-value product require roughly $4h_qSd_h$ FLOPs per layer. For a full prompt, the number of permitted query/key pairs is $S(S+1)/2$, giving roughly $2h_qd_hS(S+1)$ FLOPs per layer if the implementation avoids masked upper-triangular work. Kernel padding, block boundaries, and execution choices can increase the actual work. Softmax, positional transforms, normalization, and sampling are omitted from this arithmetic count, not declared free.\n\nThe final prompt position already produces logits for the first generated token. Do not add a fictitious extra full prefill to produce it. Conversely, a generated token must be processed to produce the next token's logits. This off-by-one distinction appears in cache lengths, timing definitions, and benchmarks with very short outputs.\n\n## Work a concrete model\n\nConsider an invented dense decoder with $L=32$, $d=4096$, $f=11008$, $h_q=32$, $h_{kv}=8$, and $d_h=128$. These values describe an exercise configuration, not a claim about a named checkpoint. Attention projections contain 41,943,040 weights per layer; the gated MLP contains 135,266,304. Across 32 layers, these block matrices contain 5,670,699,008 weights. Their BF16 storage is about 11.34 decimal GB, before the vocabulary projection and other tensors.\n\nAt a hypothetical sustained bandwidth of 1 TB/s, reading those weights once takes 11.34 ms. This is a bound on a component under the assumption that the weights must come from device memory. It is not a promised token latency. At batch eight, that same weight stream can support eight token rows, so the weight-only contribution amortized per token becomes about 1.42 ms. The user still waits for a whole decode step, and its duration may grow with batch size.\n\nAt context 8192, attention arithmetic for one sequence is approximately $4\\times32\\times8192\\times128\\times32=4.29$ billion FLOPs across layers. Block matrix arithmetic is approximately 11.34 billion FLOPs. Attention already contributes a material fraction of arithmetic; its cache traffic can matter even more. “Decode is just loading weights” is an inadequate long-context model.\n\n## Build the smallest correct decoder\n\nStart from an uncached reference whose causal mask is easy to inspect. Then add per-layer key/value state. On each incremental call, project only the new hidden state, apply the correct absolute positional index, append its key and value, and attend over the valid cache extent. Test logits at every position against the full causal reference. Sampling can hide numerical differences; compare logits before comparing generated strings.\n\n```python\n# Conceptual shape contract; the supplied lab provides a runnable reference.\nq, k_new, v_new = project(hidden_new)\nk_cache = append(k_cache, k_new)\nv_cache = append(v_cache, v_new)\nlogits = attend(q, k_cache, v_cache, valid_lengths)\n```\n\nA cache is correct only if it reproduces the original conditional computation. If the model uses a sliding window, recurrent state, latent attention, or nonstandard positional encoding, rewrite the state contract rather than forcing it into this sketch. The [GQA paper](https://arxiv.org/abs/2305.13245) is useful here because it makes KV-head count an explicit architectural variable.\n\n## Turn the derivation into an experiment\n\nUse the supplied cost-model lab to check units, then extend the decoder lab. Sweep prompt lengths, active batch sizes, and output lengths independently. Measure prefill time, each decode step, and peak allocated memory. Warm up compilation and allocator state separately from the measured region. On asynchronous accelerators, use device timing or synchronize the boundaries; a host timer around kernel submission measures submission unless you force completion.\n\nBefore running, write three predictions: which region is weight-bound, where cache reads become significant, and whether a longer prompt changes only first-token latency or also subsequent steps. After running, explain the residual between predicted components and observation. An error is productive if it identifies missing work: vocabulary projection, graph replay overhead, cache layout, tensor-core underutilization, or transfer latency. Your deliverable is a small predictive model plus evidence that can disprove it. A single impressive tokens-per-second number cannot do that.",
+    "exercises": [
+      {
+        "title": "Audit a block parameter count",
+        "prompt": "For d=2048, f=5504, h_q=16, h_kv=4, d_h=128, L=24, compute block-matrix parameters and BF16 bytes. Exclude embeddings and biases.",
+        "hint": "Count Q and output separately from K and V; the MLP has three matrices.",
+        "solution": "Per layer: 2(2048²)+2(2048)(4)(128)+3(2048)(5504)=44,302,336 parameters. Across 24 layers: 1,063,256,064 parameters, or 2,126,512,128 bytes in BF16. This is about 2.127 decimal GB, not 2.127 GiB."
+      },
+      {
+        "title": "Find the crossover in the toy cost model",
+        "prompt": "For the article model, solve for S where incremental attention FLOPs equal block-matrix FLOPs for one sequence. Then explain why this is not necessarily the latency crossover.",
+        "hint": "Cancel L and equate 4h_qSd_h with 2P_block.",
+        "solution": "S=P_block/(2h_qd_h)=177,209,344/8192=21,632 tokens. Arithmetic equality ignores separate memory traffic, different kernel efficiency, cache reuse, and non-matmul work. A bandwidth crossover can occur at a different length."
+      },
+      {
+        "title": "Prove your cache rather than eyeballing text",
+        "prompt": "Extend the tiny decoder reference with a test that compares full-sequence logits against token-by-token cached logits at every position, then test chunked input and variable lengths.",
+        "hint": "Disable dropout and compare before sampling; record absolute position offsets.",
+        "solution": "Run both paths with identical weights and tokens in evaluation mode. Concatenate cached logits and compare the complete tensor using a declared dtype-dependent tolerance. Include lengths 1, 2, an odd length, and a chunk boundary. A mismatch only after the first chunk suggests positional offsets or mask alignment; a mismatch after batch compaction suggests incorrect request-to-cache mapping. Passing one generated sentence is not a correctness argument."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Which operation changes most directly when prefill is replaced by single-token decode?",
+        "options": [
+          "The model weights become smaller.",
+          "The projection GEMMs have fewer token rows.",
+          "The number of layers becomes one.",
+          "The vocabulary projection disappears."
+        ],
+        "answer": 1,
+        "explanation": "The same projection weights now act on far fewer token rows: roughly B rows during ordinary decode instead of B×S during prefill. This reduces weight reuse per invocation; it does not reduce the model’s parameter count or layer count."
+      },
+      {
+        "question": "A batch of eight has a 16 ms decode step. What follows if every request emits one token?",
+        "options": [
+          "Every user observes 2 ms inter-token latency.",
+          "Aggregate output throughput is 500 tokens/s during those steps.",
+          "The model has eight times fewer parameters.",
+          "The service necessarily meets its first-token objective."
+        ],
+        "answer": 1,
+        "explanation": "Eight tokens per 0.016-second iteration gives 8/0.016=500 aggregate tokens/s while the batch remains full. Each request still waits approximately 16 ms between its own tokens, so dividing step time by batch size does not give user-visible inter-token latency."
+      },
+      {
+        "question": "Which comparison is the strongest initial KV-cache correctness test?",
+        "options": [
+          "Compare cached and full causal logits at every valid position.",
+          "Compare average output length.",
+          "Compare GPU utilization.",
+          "Compare one sampled answer."
+        ],
+        "answer": 0,
+        "explanation": "Comparing cached and full causal logits at every valid position tests the actual conditional computation before sampling introduces randomness. A generated sentence can look plausible despite a wrong position offset or mask, and average output length is much too weak to detect those errors."
+      },
+      {
+        "question": "The weight-read estimate is 10 ms but observed decode takes 18 ms. What is the defensible conclusion?",
+        "options": [
+          "The bandwidth specification is false.",
+          "KV caching failed.",
+          "The bound omits work and effective execution effects that must be measured.",
+          "The model must use MoE."
+        ],
+        "answer": 2,
+        "explanation": "The estimate bounds only weight movement under its bandwidth and residency assumptions. The remaining 8 ms could involve KV traffic, arithmetic, communication, launch overhead, or imperfect overlap; a profiler and controlled shape sweep are needed to distinguish them."
+      },
+      {
+        "question": "Why can an MoE model violate a simple 2P FLOPs/token estimate based on total parameters?",
+        "options": [
+          "MoE never reads weights.",
+          "The multiply-add convention changes.",
+          "All experts execute but only one stores results.",
+          "Only selected experts execute for a token, while shared components still execute."
+        ],
+        "answer": 3,
+        "explanation": "A token activates only selected experts, while attention and other shared components still execute. Total resident parameters therefore differ from per-token active parameters; across a batch, different routes can nevertheless cause many experts’ weights to be read."
+      }
+    ],
+    "resources": [
+      {
+        "title": "GQA: Training Generalized Multi-Query Transformer Models",
+        "url": "https://arxiv.org/abs/2305.13245",
+        "type": "Paper",
+        "why": "Use the architecture to reason about query heads versus cached KV heads.",
+        "required": true
+      },
+      {
+        "title": "CUDA semantics in PyTorch",
+        "url": "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "type": "Documentation",
+        "why": "Read asynchronous execution and timing guidance before interpreting measurements.",
+        "required": true
+      },
+      {
+        "title": "GPU MODE lecture materials",
+        "url": "https://github.com/gpu-mode/lectures",
+        "type": "Repository",
+        "why": "Lecture 1 provides profiling and PyTorch integration material.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — All About Performance (L2)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture2.pdf",
+        "type": "Course",
+        "why": "Use the transformer cost accounting as a second derivation; compare its assumptions with your own model.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Spring 2026 archive",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/",
+        "type": "Course",
+        "why": "Original lecture, assignment, and student-project links. This independent course is not affiliated with Berkeley.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Prediction before measurement",
+      "path": "labs/01_cost_model.py",
+      "command": "python3 labs/01_cost_model.py",
+      "task": "Run the supplied analytical calculator, which reports weight traffic, KV payload, and dense linear-layer estimates; it omits attention FLOPs. Learner work: add the attention term and a configuration from a real model card, then compare predictions with independently measured decoder timings.",
+      "success": "A reproducible table separates predicted FLOPs/bytes from observed prefill and decode times, with units and error explanations."
+    },
+    "completion": [
+      "Derive one model configuration without copying a parameter-count calculator.",
+      "Pass cached-versus-uncached logit tests at several lengths.",
+      "Publish one prediction that measurements confirmed and one that required revision."
+    ]
+  },
+  {
+    "id": "02",
+    "slug": "memory-is-the-model",
+    "title": "KV cache, memory budgets, and state correctness",
+    "subtitle": "Calculate capacity without confusing it with bandwidth.",
+    "phase": 1,
+    "week": 2,
+    "minutes": 35,
+    "level": "Core",
+    "hardware": "CPU",
+    "tags": [
+      "KV cache",
+      "GQA",
+      "memory layout"
+    ],
+    "outcomes": [
+      "Calculate KV payload and allocator overhead for heterogeneous requests.",
+      "Explain why model memory, peak workspace, and KV capacity are distinct.",
+      "Preserve logical positions and ownership when cache storage moves."
+    ],
+    "body": "## Capacity is a state equation\n\nThe first inference capacity question is not “How many parameters fit?” It is “Which objects must be resident at the same time?” Model weights coexist with cached state, activations, temporary workspaces, graph pools, runtime buffers, and allocator slack. Some objects persist for the life of a replica; others follow requests or kernel invocations. An honest memory budget names them separately and measures their peaks under the intended execution path.\n\nFor conventional key/value attention with uniform layer shape, the payload for one token across all layers is\n\n$$m_{token}=2Lh_{kv}d_hb_{kv}.$$\n\nThe factor two represents keys and values; $b_{kv}$ is bytes per cached scalar. For a heterogeneous batch with current logical lengths $S_i$, payload is $m_{token}\\sum_i S_i$. This formula excludes page tables, rounding, quantization scales, and duplicate or shared prefixes. It also assumes every layer caches the same representation. A hybrid model requires a sum over layer-specific state layouts.\n\nWith 32 layers, eight KV heads, dimension 128, and two-byte state, each token needs 131,072 bytes: exactly 128 KiB. An 8192-token sequence therefore consumes 1 GiB of KV payload. A 32-GiB cache pool supports 32 such sequences at that length before fragmentation or metadata. It does not support 32 sequences of arbitrary future length. Generation expands state, and admission must account for that expansion or support an explicit recovery policy.\n\n## Architectural compression is not an allocator trick\n\nMulti-head attention caches a key and value for each attention head. Grouped-query attention shares each KV head among a group of query heads, reducing cached scalars while retaining multiple query projections. With 32 query heads and eight KV heads, conventional KV storage is one quarter of the 32-KV-head alternative. The [GQA paper](https://arxiv.org/abs/2305.13245) describes this architectural tradeoff; changing a runtime flag cannot generally turn arbitrary pretrained multi-head weights into equivalent grouped-query weights.\n\nSliding-window attention bounds how much old state a layer needs, but only when the model's semantics allow old tokens to be discarded. Keep logical position separate from ring-buffer offset. Token 9000 might occupy physical slot 808, yet its positional transform still corresponds to logical position 9000. Prefix reuse also requires matching the computational context, not merely the bytes in a physical slot.\n\nQuantizing KV reduces bytes but adds scale metadata and a numerical approximation. Latent-attention architectures can use a different compressed state altogether. The correct budgeting procedure is to inspect the cached tensors actually consumed by the implementation. Counting conceptual keys and values from a diagram can overestimate or underestimate resident state when the engine transforms or duplicates it.\n\n## Paging changes reservation and reclamation\n\nSuppose cache pages each hold 16 tokens. Requests of lengths 17, 31, and 32 reserve 32, 32, and 32 token slots. Their live payload represents 80 tokens; allocation represents 96; internal waste represents 16. The waste is concentrated in partially occupied final pages. Paging avoids demanding one large contiguous region per growing sequence, but it does not make allocation overhead identically zero.\n\nThe central abstraction in [PagedAttention](https://arxiv.org/abs/2309.06180) is a logical-to-physical mapping. An attention kernel follows a request's block table to find the appropriate KV data. Logical token order remains stable even if physical page identifiers are irregular. Allocation, sharing, and reclamation become separable from sequence semantics. This separation is useful well beyond one particular engine.\n\nA page can be shared by several requests only while its contents remain valid for all of them. A shared partially filled page creates a write hazard if continuations diverge. Copy-on-write or immutable full-page sharing resolves the hazard. Reference counts should include every owner that can still read the page, including asynchronous device work. Freeing the last host reference before the GPU completes can corrupt another request without causing an immediate crash.\n\n## Capacity and bandwidth answer different questions\n\nA cache that fits may still be expensive to read. Each new query in full attention must interact with the relevant history. Ignoring reuse and implementation details, conventional decode reads approximately its key/value payload per layer invocation. A one-GiB sequence can therefore add roughly one GiB of cache reads per decode step. With many active sequences, the sum can rival or exceed model-weight traffic.\n\nDo not divide total KV capacity by advertised memory bandwidth and call the result token latency. Some cached data may hit lower-level caches; grouped-query kernels may reuse a KV tile across queries; layout can create redundant transactions; and computation can overlap movement. The useful experiment varies context length while holding active batch fixed. A nearly linear latency increase is evidence consistent with history-dependent work, but a profiler is needed to identify whether bytes, arithmetic, or launch partitioning dominates.\n\n## Make memory experiments reproducible\n\nBuild a ledger with columns for weights, KV payload, reserved cache, temporary tensors, and framework-reserved memory. Record both allocated and reserved device memory if your framework exposes them. A caching allocator retaining a freed region is not automatically a leak. Conversely, stable total reserved memory can conceal a logical leak when the free-page pool shrinks after each cancellation.\n\n```python\n# A logical allocator invariant, independent of framework allocator statistics.\nassert free_pages.isdisjoint(live_pages)\nassert len(free_pages) + len(live_pages) == total_pages\nfor request in active_requests:\n    assert request.length <= len(request.pages) * page_tokens\n```\n\nExtend these assertions for shared pages using reference counts instead of counting a page once per request. Exercise allocation at an exact page boundary, one token past it, cancellation during generation, and divergent continuations after a shared prefix. The supplied decoder is a numerical reference; building the page manager is learner work. End the week with a capacity prediction validated by allocation accounting and a bandwidth prediction validated by timing. They are related results, but neither substitutes for the other.",
+    "exercises": [
+      {
+        "title": "Budget a heterogeneous cache",
+        "prompt": "A 24-layer decoder uses 4 KV heads, head dimension 128, and two-byte KV. Requests have lengths 2048, 4096, and 8192. Compute payload and remaining token capacity in a 4-GiB KV pool.",
+        "hint": "First compute bytes per token, then sum lengths; use binary GiB.",
+        "solution": "Bytes per token are 2×24×4×128×2=49,152. Total length is 14,336, so payload is 704,643,072 bytes, or 672 MiB. Four GiB can hold floor(4,294,967,296/49,152)=87,381 whole tokens, leaving 73,045 token slots before allocator and metadata overhead."
+      },
+      {
+        "title": "Expose a copy-on-write failure",
+        "prompt": "Two requests share a 16-token page containing 12 valid tokens, then append different token 13 values. Specify a safe algorithm and a test that breaks the unsafe one.",
+        "hint": "Reference counts govern ownership; logical validity is separate from reserved capacity.",
+        "solution": "Before writing to the shared partial page, allocate a private page, copy the 12 valid KV entries, replace the writer’s table entry, and decrement the old page count. Test two continuations with deliberately different K/V values, alternating their append order. Each request must match a private-cache reference. Sharing only full immutable pages avoids this partial-page copy at the cost of less reuse."
+      },
+      {
+        "title": "Distinguish a retained allocator pool from a leak",
+        "prompt": "Design an experiment with 100 cycles of admission, generation, and cancellation. What must return to baseline, and what may legitimately remain high?",
+        "hint": "Measure logical ownership separately from device allocator reservation.",
+        "solution": "After all device work completes, the cache allocator’s active owners and outstanding requests must be zero, and its free-page count must return to the initial value unless explicitly retained prefix entries account for the difference. Framework reserved memory may remain high for reuse. Track these counters after every cycle and fail immediately on monotonic lost pages; total process memory alone cannot diagnose ownership."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Which variable directly reduces standard KV payload when other terms are fixed?",
+        "options": [
+          "Number of query heads only.",
+          "Number of KV heads.",
+          "Vocabulary size.",
+          "Sampling temperature."
+        ],
+        "answer": 1,
+        "explanation": "The conventional payload is 2×layers×KV-heads×head-dimension×tokens×bytes-per-scalar. Query heads may share those cached KV heads, so reducing query-head count alone does not necessarily remove cached tensors."
+      },
+      {
+        "question": "With 16-token pages, a 33-token request reserves how many token slots?",
+        "options": [
+          "32",
+          "33",
+          "48",
+          "64"
+        ],
+        "answer": 2,
+        "explanation": "Ceiling(33/16)=3 pages, which reserve 48 token slots. Only 33 slots contain live tokens and 15 remain unused in the final page; paging reduces allocation waste but does not eliminate final-page rounding."
+      },
+      {
+        "question": "When is it safe to reuse a physically freed cache page?",
+        "options": [
+          "After all owners and in-flight readers/writers have released it.",
+          "As soon as its sequence length is zero.",
+          "When a host dictionary entry is removed.",
+          "Immediately after a client disconnects."
+        ],
+        "answer": 0,
+        "explanation": "Device work can continue reading or writing a page after its host-side request object is removed. Reuse is safe only once every logical owner and every in-flight operation has released it, otherwise a new request can overwrite state the old kernel still needs."
+      },
+      {
+        "question": "A sliding-window ring buffer wraps physical indices. Which index should ordinary absolute positional logic use?",
+        "options": [
+          "The logical token position.",
+          "The physical slot only.",
+          "The free-list position.",
+          "Always zero for cached tokens."
+        ],
+        "answer": 0,
+        "explanation": "The logical position identifies where a token belongs in the model’s sequence; the physical slot identifies where its bytes happen to live. Wrapping a ring buffer changes storage location without resetting the sequence’s positional coordinates."
+      },
+      {
+        "question": "Reserved GPU memory remains high after all requests finish. Which observation most directly identifies a cache allocator leak?",
+        "options": [
+          "A large model remains loaded.",
+          "The process is still alive.",
+          "The free-page count fails to recover without retained-cache owners.",
+          "The allocator reserves a reusable slab."
+        ],
+        "answer": 2,
+        "explanation": "A persistent deficit in the free-page count, with no active or retained owners explaining it, violates allocator accounting. A framework may intentionally retain freed device slabs for reuse, so high reserved memory by itself is not evidence of a cache leak."
+      }
+    ],
+    "resources": [
+      {
+        "title": "PagedAttention and vLLM",
+        "url": "https://arxiv.org/abs/2309.06180",
+        "type": "Paper",
+        "why": "Study logical blocks, physical blocks, sharing, and fragmentation.",
+        "required": true
+      },
+      {
+        "title": "GQA",
+        "url": "https://arxiv.org/abs/2305.13245",
+        "type": "Paper",
+        "why": "Connect architectural KV sharing to cache capacity.",
+        "required": false
+      },
+      {
+        "title": "vLLM hybrid KV-cache manager design",
+        "url": "https://github.com/vllm-project/vllm/blob/main/docs/design/hybrid_kv_cache_manager.md",
+        "type": "Documentation",
+        "why": "Inspect why heterogeneous layer state complicates allocation; pin the commit you study.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "KV state and ownership",
+      "path": "labs/02_tiny_decoder.py",
+      "command": "python3 labs/02_tiny_decoder.py",
+      "task": "Run the supplied random-weight PyTorch decoder, which checks cached versus full logits for single-token and multi-token suffixes. It has contiguous per-layer caches, not paging or admission. Learner work: instrument tensor bytes and build a separate page-ownership simulator with cancellation.",
+      "success": "Predicted tensor bytes match measured tensor storage; randomized allocator traces return all unretained pages without corrupting logits."
+    },
+    "completion": [
+      "Reconcile a model memory ledger with a peak measurement.",
+      "Demonstrate a page-boundary and shared-page test.",
+      "Explain one case where memory fits but decode bandwidth becomes limiting."
+    ]
+  },
+  {
+    "id": "03",
+    "slug": "measure-what-the-user-waits-for",
+    "title": "Benchmarking, rooflines, and queueing",
+    "subtitle": "A fast kernel can coexist with a slow service.",
+    "phase": 1,
+    "week": 3,
+    "minutes": 35,
+    "level": "Core",
+    "hardware": "CPU",
+    "tags": [
+      "roofline",
+      "latency",
+      "queueing"
+    ],
+    "outcomes": [
+      "Construct latency and throughput measurements with explicit boundaries.",
+      "Use roofline and queueing models without treating them as measured reality.",
+      "Compare systems by useful work completed under the same workload and SLO."
+    ],
+    "body": "## Define the clock before the metric\n\nA benchmark is an executable claim about a workload. Every important number needs a start event, an end event, a population, and a unit. Time to first token may begin when the client sends a request, when the server accepts it, or when the GPU starts prefill. Those are different metrics. Record client arrival, server admission, prefill start, first token delivery, each later token delivery, and final completion when possible. Keep the raw event stream so you can change definitions without rerunning the experiment.\n\nFor a request producing $N>1$ tokens, a common mean time per output token after the first is $(t_N-t_1)/(N-1)$. Inter-token latency is the individual sequence $t_j-t_{j-1}$. Their distributions answer different questions: a request with nine 10-ms gaps and one 200-ms stall can have a tolerable average and a conspicuous interruption. A one-token response has no after-first-token TPOT; report it as undefined rather than zero.\n\n## Derive a roofline, then attack its assumptions\n\nLet $F$ be required FLOPs, $D$ be bytes transferred across the memory level under study, $P$ be sustainable arithmetic throughput, and $B$ be sustainable bandwidth. Arithmetic intensity is $I=F/D$. An idealized kernel time obeys\n\n$$T\\geq\\max(F/P,D/B),\\qquad P_{achievable}\\leq\\min(P,BI).$$\n\nThe maximum assumes ideal overlap between compute and traffic; adding the terms assumes no overlap. Real execution can include neither ideal. Use the model to identify a promising optimization, not to certify the implementation. The relevant bytes are transactions at a specified level such as HBM, not simply the sizes of input tensors. Reuse and reloads change the relationship.\n\nFor a hypothetical device sustaining 100 TFLOP/s and 1 TB/s on the relevant operations, the ridge point is 100 FLOP/byte. A kernel with 2 TFLOPs and 40 GB of traffic has intensity 50 FLOP/byte. Its compute floor is 20 ms; its memory floor is 40 ms. Halving arithmetic alone leaves the memory floor unchanged. Halving bytes moves it to the ridge point and lowers the ideal floor to 20 ms. This is a prediction to test with counters and timings, not a hardware benchmark.\n\nA vendor peak for one numeric format is not an appropriate ceiling for a different operation. Dense and structured-sparse peaks differ. Tiny matrices may not supply enough parallelism to approach either. The [CUDA Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/) is a useful reference for the distinction between application improvement and isolated resource utilization.\n\n## Queueing turns variability into latency\n\nImagine requests arrive at rate $\\lambda$ and the service completes them at average capacity $\\mu$. In the deliberately simplified M/M/1 model, utilization is $\\rho=\\lambda/\\mu$ and mean response time is $1/(\\mu-\\lambda)$. At capacity ten requests per second, increasing arrivals from five to nine changes the model's mean response time from 0.2 seconds to one second. The compute service time did not change. Queueing did.\n\nReal inference violates many M/M/1 assumptions: service times vary with prompt and output length, batching couples requests, prefix hits create classes, and scheduling may preempt prefills. The model's value is the warning that headroom and variance matter, not a promise that its curve fits your engine. Little's law, $L=\\lambda W$, provides a broader accounting check for a stable system with consistent boundaries. If 20 requests complete per second and mean time in the system is 0.8 seconds, the mean number in flight should be about 16 under stationary conditions.\n\n## Do not let the load generator hide overload\n\nA closed-loop client starts new work when previous work finishes. When the server slows, offered load falls automatically. This can be useful for a fixed-concurrency capacity test, but it cannot establish latency under an independent arrival process. An open-loop generator schedules arrivals without waiting for completions. If it falls behind, record intended arrival time and actual send time; otherwise the generator can hide the backlog it was meant to expose.\n\nUse both experiments and label them. Sweep offered arrival rate until the queue grows or the SLO fails. Include a burst and a long-prompt/short-prompt mixture. Drain outstanding requests after the arrival window or report censoring explicitly. Excluding slow unfinished requests makes an overloaded service appear faster. Warm prefix caches and cold prefix caches are different workloads, so their results deserve separate rows.\n\n## Report goodput and uncertainty\n\nChoose a service-level objective before optimizing. A request-level goodput might count completed requests per second that satisfy both TTFT below 500 ms and p95 inter-token latency below 50 ms. An alternative might count output tokens from successful requests. Either can be legitimate, but state the numerator and denominator. Never silently count rejected requests as successes or remove them from the offered-load calculation.\n\n```python\n# Simplified request-level goodput; thresholds are experiment choices.\naccepted = [r for r in completed if r.ttft_ms <= 500 and r.itl_p95_ms <= 50]\ngoodput = len(accepted) / measurement_window_seconds\n```\n\nPreserve individual samples, run independent repetitions, and describe confidence intervals with the resampling unit. Repeated token gaps within one request are correlated; treating them as independent requests exaggerates certainty. Extreme percentiles need enough observations to be meaningful. A p99 from 50 requests mostly describes one or two tail samples, so disclose its fragility.\n\nUse the supplied prefill/decode interference simulation to learn timing accounting, then instrument a real engine. Its --events option already exports arrival and token timestamps; admission, failures, and burst traces are learner extensions. Simulation timings are chosen assumptions, never evidence of GPU performance. Your final plot should show offered load, achieved throughput, goodput, latency percentiles, and rejection or timeout rate together. That joint view prevents a “speedup” created by dropping hard work, shortening outputs, or quietly changing the benchmark population.\n\n## Optional Berkeley practicum\n\nBerkeley’s [Spring 2026 Assignment 1](https://scalable-ai.eecs.berkeley.edu/S2026/assets/assignment_1.zip) provides a complementary arithmetic-intensity notebook and a larger Mixtral optimization challenge. Start with the notebook after deriving your own FLOP and byte counts. The training challenge assumes substantial multi-GPU hardware; it is optional here. For your inference portfolio, use the original profiling workflow as a comparison point, then create your own decode-focused shape sweep. Explain why training utilization and latency-constrained serving goodput answer different questions. Attribute the assignment when publishing related work; the exercises in this chapter are separate original course material.",
+    "exercises": [
+      {
+        "title": "Apply the roofline without adding incompatible limits",
+        "prompt": "A kernel performs 0.6 TFLOPs and transfers 12 GB. Sustained ceilings are 60 TFLOP/s and 0.8 TB/s. Compute intensity and the ideal time floor. If observed time is 25 ms, what can you conclude?",
+        "hint": "Use consistent decimal units; the bound uses max, not min.",
+        "solution": "Intensity is 50 FLOP/byte. Compute floor is 10 ms; memory floor is 15 ms; ideal floor is 15 ms. Observed time is 1.67× the floor. The gap may be overhead or lower achieved efficiency. The model alone cannot assign the cause; profile bytes and execution before claiming bandwidth saturation."
+      },
+      {
+        "title": "Reconstruct request metrics",
+        "prompt": "A request is sent at 0 ms and tokens arrive at 120, 140, 165, and 225 ms. Compute TTFT, end-to-end latency, mean after-first TPOT, and every ITL.",
+        "hint": "There are three gaps for four tokens.",
+        "solution": "TTFT=120 ms, end-to-end=225 ms, TPOT=(225−120)/3=35 ms. ITLs are 20, 25, and 60 ms. Mean TPOT conceals the 60-ms stall. If server admission occurred at 30 ms, admission-based TTFT would be 90 ms; both require labels."
+      },
+      {
+        "title": "Design an overload experiment that cannot self-throttle",
+        "prompt": "Specify an arrival generator, trace schema, stopping rule, and reporting policy for comparing two schedulers near saturation.",
+        "hint": "Keep intended arrivals, completed outputs, failures, and outstanding work.",
+        "solution": "Generate one seeded open-loop trace with independently scheduled arrivals and fixed prompt/output specifications. Replay it unchanged for each scheduler; record intended/send/admission/first-token/token/completion times and errors. Stop admissions after a fixed interval, then drain with a stated timeout. Report offered and completed rates, censored requests, rejections, and latency by class. Repeat at several rates and with multiple seeds; a closed-loop run may be supplementary but cannot replace this experiment."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Which result is most vulnerable to coordinated omission?",
+        "options": [
+          "An open-loop trace with intended timestamps.",
+          "A fixed tensor-shape kernel microbenchmark.",
+          "A report that includes timeouts.",
+          "A load generator that waits for a response before sending its next request, presented as fixed arrival-rate evidence."
+        ],
+        "answer": 3,
+        "explanation": "When a closed-loop generator waits for replies, a slow server automatically causes it to submit less work. Presenting that run as evidence for an independent fixed arrival rate omits the backlog users would have experienced; record intended arrival times in an open-loop test."
+      },
+      {
+        "question": "What is the appropriate idealized roofline lower bound on time?",
+        "options": [
+          "min(F/P,D/B)",
+          "max(F/P,D/B)",
+          "P/B",
+          "F/D"
+        ],
+        "answer": 1,
+        "explanation": "Both F/P seconds of arithmetic and D/B seconds of movement must fit into the execution interval. Perfect overlap gives the maximum as a lower bound; taking the minimum ignores required work, while adding the two assumes no overlap."
+      },
+      {
+        "question": "A response contains one output token. What is its after-first-token TPOT?",
+        "options": [
+          "Equal to TTFT.",
+          "Always zero.",
+          "Undefined under the (t_N−t_1)/(N−1) definition.",
+          "Equal to end-to-end latency divided by two."
+        ],
+        "answer": 2,
+        "explanation": "For one token, there are zero after-first-token intervals and N−1=0. Reporting zero TPOT would make single-token responses look like infinitely fast decoding; instead mark the metric undefined and report their TTFT or end-to-end latency."
+      },
+      {
+        "question": "A service reports higher throughput after rejecting its longest requests. What must accompany the comparison?",
+        "options": [
+          "Only a higher peak GPU utilization.",
+          "Only median latency.",
+          "Nothing; throughput already includes reliability.",
+          "Offered workload, rejection rate, and an unchanged useful-work/SLO definition."
+        ],
+        "answer": 3,
+        "explanation": "Rejecting long requests changes the amount and difficulty of work that reaches execution. A fair comparison retains the same offered trace and reports rejections, timeouts, quality constraints, and useful completions under the same SLO, rather than silently comparing different populations."
+      },
+      {
+        "question": "Why is a p99 latency estimate from 50 requests weak evidence?",
+        "options": [
+          "Percentiles require normally distributed data.",
+          "It ignores prompt tokens by definition.",
+          "p99 is always smaller than the median.",
+          "The extreme tail is represented by very few observations."
+        ],
+        "answer": 3,
+        "explanation": "With 50 requests, the upper one percent contains only half a request in expectation, so an empirical p99 is controlled by roughly the largest observations and the estimator convention. More independent samples and explicit uncertainty are needed before treating small changes as a stable tail improvement."
+      }
+    ],
+    "resources": [
+      {
+        "title": "CUDA Best Practices Guide",
+        "url": "https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/",
+        "type": "Documentation",
+        "why": "Use the performance measurement and bandwidth sections as a measurement reference.",
+        "required": true
+      },
+      {
+        "title": "PyTorch CUDA semantics",
+        "url": "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "type": "Documentation",
+        "why": "Understand synchronization and asynchronous timing.",
+        "required": true
+      },
+      {
+        "title": "Sarathi-Serve",
+        "url": "https://arxiv.org/abs/2403.02310",
+        "type": "Paper",
+        "why": "Read the throughput/latency experiments critically; inspect workload and SLO definitions.",
+        "required": false
+      },
+      {
+        "title": "GPU MODE: How to profile CUDA kernels in PyTorch",
+        "url": "https://www.youtube.com/watch?v=LuhJEEJQgUM",
+        "type": "Video",
+        "why": "Lecture 1 links profiler evidence to kernel integration; the speaker confirms the recording in the PyTorch forum.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — All About Performance (L2)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture2.pdf",
+        "type": "Course",
+        "why": "Use the transformer cost accounting as a second derivation; compare its assumptions with your own model.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Assignment 1 (ZIP)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/assignment_1.zip",
+        "type": "Course",
+        "why": "Optional original homework: arithmetic-intensity notebooks and a Mixtral training optimization challenge. The full challenge specifies 8 H100s; use the smaller analysis track if needed.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Reproducible load and latency accounting",
+      "path": "labs/03_scheduler.py",
+      "command": "python3 labs/03_scheduler.py --events",
+      "task": "Run the supplied interference simulator with --events to inspect arrivals and token timestamps. It compares prefill-first with chunked scheduling under a toy additive cost model; it does not implement KV admission, cancellation, or real GPU execution. Learner work: add burst traces, failure accounting, and additional SLO definitions before validating them on a real server.",
+      "success": "Every offered request is accounted for, repeated traces are comparable, and simulated times are clearly separated from hardware measurements."
+    },
+    "completion": [
+      "Publish metric definitions and the raw event schema.",
+      "Identify a bottleneck with a roofline prediction and a targeted measurement.",
+      "Compare scheduler policies with tail latency, failures, and useful throughput together."
+    ]
+  },
+  {
+    "id": "04",
+    "slug": "the-gpu-is-a-data-movement-machine",
+    "title": "The GPU is a data-movement machine",
+    "subtitle": "Connect a tensor expression to threads, transactions, and waiting.",
+    "phase": 2,
+    "week": 4,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "1 GPU",
+    "tags": [
+      "CUDA",
+      "memory hierarchy",
+      "profiling"
+    ],
+    "outcomes": [
+      "Explain how a block consumes registers and shared memory on an SM.",
+      "Predict whether an access pattern coalesces before running it.",
+      "Use timeline and kernel profiles to distinguish launch, memory, and execution limits."
+    ],
+    "body": "## Begin with a factory, not a core count\n\nA GPU gets throughput by keeping many operations in flight. An individual memory request can take much longer than one arithmetic instruction, so the machine schedules other ready work while some threads wait. This is why “more threads” can help, but only when those threads expose independent work and fit into finite resources. Thread count is not a substitute for data reuse, and occupancy is not the objective function.\n\nIn CUDA's execution model, a grid contains thread blocks, blocks contain threads, and threads execute in warps. On NVIDIA hardware the warp contains 32 threads. Blocks are assigned to streaming multiprocessors, where they consume registers, shared memory, scheduling slots, and other architecture-specific resources. Read the current [CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-programming-guide/) for the precise rules on your target architecture; numerical resource limits differ across devices.\n\nA block is a cooperation boundary. Threads within it can exchange data through shared memory and synchronize with an appropriate block barrier. You cannot assume a normal barrier synchronizes arbitrary blocks, nor assume blocks execute in a chosen order. A correct algorithm must work when blocks are scheduled in different orders or when only a subset is resident.\n\n## Follow one warp's addresses\n\nConsider 32 lanes loading four-byte floats. If lane $j$ loads element $j$, the warp requests a contiguous 128-byte span. If lane $j$ loads element $32j$, its requests are scattered across a span of almost four KiB. The exact memory-transaction count depends on alignment, caching, and architecture, but the second pattern generally requires more transactions to deliver the same useful 128 bytes. This is the practical meaning of coalescing: neighboring lanes should usually request neighboring addresses.\n\nTensor shapes do not determine those addresses by themselves. Strides do. A transposed matrix may have exactly the same number of elements and a dramatically different access pattern. Before optimizing a kernel, write the address expression for each operand as a function of program, warp, lane, and reduction index. If you cannot do that, you are tuning a black box you have not yet described.\n\nShared memory lets a block load a tile once and reuse it across many arithmetic operations. It also has banks, finite capacity, and synchronization requirements. Moving data into shared memory is not automatically an improvement: if each value is used once, staging may add instructions and barriers without reducing global traffic. The benefit must exceed its staging cost.\n\n## Resource limits create a non-monotonic optimum\n\nImagine a simplified SM with 65,536 registers available to blocks, ignoring allocation granularity and other constraints. A 256-thread block using 64 registers per thread requires 16,384 registers. At most four such blocks fit by the register constraint. Increasing usage to 96 registers needs 24,576 per block, so only two fit. Actual residency may be lower because of shared memory or architectural block limits.\n\nIt is tempting to cap registers aggressively to restore four blocks. That can force values to spill to local memory, which is backed by device memory and caches. You may gain nominal occupancy while introducing extra loads and stores. Conversely, a larger tile may reduce occupancy but improve useful reuse enough to win. Treat occupancy as explanatory evidence, not a score to maximize in isolation.\n\nThe same tradeoff appears in instruction-level parallelism. One thread holding several independent accumulators may hide arithmetic latency better, but those accumulators occupy registers. Tile size, number of warps, pipelining depth, and register lifetime form a coupled design space. Change one factor at a time until you understand the interactions.\n\n## Asynchrony creates correctness obligations\n\nHost code submits GPU work and can continue before that work completes. Operations in a stream have ordering, while independent streams need explicit dependencies when sharing data. A CPU object going out of scope does not prove that a device consumer finished. Likewise, observing a kernel launch in a trace does not prove its output was ready at the time a host timer stopped.\n\nFor an educational experiment, prefer a simple correct schedule first. Place explicit synchronization at benchmark boundaries and use device events for device elapsed time. Then remove unnecessary synchronization deliberately, retaining dependency events for shared buffers. The [PyTorch CUDA notes](https://docs.pytorch.org/docs/stable/notes/cuda.html) explain these semantics at the framework boundary.\n\n```python\n# A conceptual two-stage schedule, not a complete API example.\nproduce_on_stream_A(buffer)\nready = record_event(stream_A)\nwait_event(stream_B, ready)\nconsume_on_stream_B(buffer)\n# Reuse buffer only after its final consumer is complete.\n```\n\n## Profile at two scales\n\nBegin with a timeline. Large blank regions between kernels suggest host work, synchronization, data loading, or dependency stalls. Many tiny kernels suggest dispatch overhead or a fusion opportunity. A long kernel merits detailed counters. Starting with an instruction-level profile before locating the expensive region is an efficient way to optimize something irrelevant.\n\nNext examine one important kernel with a fixed shape. Compare useful bytes to observed traffic, inspect achieved memory throughput, and inspect occupancy and stall information as hypotheses. A memory-related stall does not necessarily mean HBM bandwidth is saturated; it can reflect latency or insufficient independent requests. Corroborate a claim with a controlled change, such as coalescing accesses or increasing the number of independent rows.\n\nThe supplied RMSNorm lab becomes your microscope this week: it contains a real Triton kernel, a reference check, and CUDA-event timing for supported Linux NVIDIA hardware. Keep its arithmetic unchanged while varying rows, width, contiguity, and launch configuration. Predict the effect before measuring. Include tiny decode-like shapes and larger prefill-like shapes. Save the profiler command, device identity, software version, warmup policy, and the specific kernel name selected. A useful report explains one improvement and one regression through address patterns or resource use. That explanation is the transferable skill; a single optimal tile on one GPU is not.",
+    "exercises": [
+      {
+        "title": "Derive a register residency ceiling",
+        "prompt": "Use the simplified 65,536-register SM. Compare 128-thread blocks at 40 registers/thread with 256-thread blocks at 80 registers/thread. Ignore all other limits.",
+        "hint": "Compute registers per block, then floor-divide; compare resident threads too.",
+        "solution": "The first uses 5120 registers/block, allowing at most 12 blocks or 1536 threads. The second uses 20,480 registers/block, allowing at most 3 blocks or 768 threads. These are only register-derived ceilings: real register granularity, warp/block limits, and shared memory can lower them."
+      },
+      {
+        "title": "Repair a strided load",
+        "prompt": "A row-major matrix X has shape [M,N]. A warp processes one column by assigning lane j to row j. Derive addresses and propose an alternative that improves coalescing without changing the output.",
+        "hint": "Row-major address is base+(row*N+column)*element_size.",
+        "solution": "The original lane stride is N elements, so each lane can touch a different transaction. Tile a rectangular region with lanes traversing adjacent columns, then perform the column reduction inside the tile using shared memory or warp communication. This may require combining partial reductions, so benchmark the extra reduction overhead against the traffic saved."
+      },
+      {
+        "title": "Prove a stream dependency",
+        "prompt": "Create two kernels where the first fills a buffer and the second reduces it, on different streams. Specify a test that can detect missing ordering and the correct dependency.",
+        "hint": "A successful run does not prove a race absent. Vary workload and buffer reuse.",
+        "solution": "Record an event after the fill and make the reduction stream wait for that event. Record a completion event after the reduction before reusing the buffer. Stress many iterations with changing sentinel values and variable delays in the producer. Compare every reduction with its expected value; use a race/synchronization checker where available. Retain explicit dependencies even if one device appears to serialize the kernels."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Why can higher occupancy make a kernel slower?",
+        "options": [
+          "The compiler may spill registers or lose useful per-thread reuse.",
+          "It changes floating-point multiplication into integer arithmetic.",
+          "It always reduces clock frequency.",
+          "It disables shared memory completely."
+        ],
+        "answer": 0,
+        "explanation": "Forcing lower register use may spill live values to memory, and changing block structure may reduce useful reuse per thread. Nominal occupancy can rise while extra loads, stores, or instructions make the kernel slower; inspect the resource tradeoff rather than maximizing one counter."
+      },
+      {
+        "question": "Which fact most directly determines whether neighboring lanes access neighboring data?",
+        "options": [
+          "The tensor’s printed shape alone.",
+          "The total GPU memory capacity.",
+          "The Python variable name.",
+          "The pointer/stride address expression for each lane."
+        ],
+        "answer": 3,
+        "explanation": "A tensor’s shape says how many coordinates exist, but its strides and lane mapping determine which addresses neighboring threads request. Two identically shaped tensors can therefore have very different transaction efficiency, especially after a transpose."
+      },
+      {
+        "question": "What does a block barrier guarantee?",
+        "options": [
+          "All blocks in the grid finish together.",
+          "The participating block’s threads satisfy the barrier’s synchronization semantics.",
+          "The CPU has consumed the result.",
+          "All streams finish together."
+        ],
+        "answer": 1,
+        "explanation": "A block barrier coordinates the participating threads within that block according to its synchronization rules. It cannot make unrelated blocks or streams complete, so using it as a grid-wide dependency can leave a race or deadlock in the algorithm."
+      },
+      {
+        "question": "A timeline has large gaps between short kernels. What is the best first investigation?",
+        "options": [
+          "Increase model parameter count.",
+          "Immediately rewrite the longest instruction in assembly.",
+          "Host dispatch, dependencies, synchronization, and input preparation.",
+          "Conclude HBM bandwidth is saturated."
+        ],
+        "answer": 2,
+        "explanation": "Blank intervals indicate that useful device work was not running or ready to run, so inspect submission, input preparation, synchronization, and dependencies first. Making an already short kernel slightly faster does not remove a large host-side gap."
+      },
+      {
+        "question": "When is shared-memory staging most likely to help?",
+        "options": [
+          "Whenever data is read exactly once.",
+          "When saved repeated global reads outweigh staging and synchronization costs.",
+          "Whenever occupancy is already maximal.",
+          "When a kernel has no parallelism."
+        ],
+        "answer": 1,
+        "explanation": "Staging pays off when a loaded tile is reused enough to save more expensive global transactions than the added loads, barriers, and shared-memory operations cost. For a value used once, staging may add work without avoiding any global read."
+      }
+    ],
+    "resources": [
+      {
+        "title": "CUDA Programming Guide",
+        "url": "https://docs.nvidia.com/cuda/cuda-programming-guide/",
+        "type": "Documentation",
+        "why": "Study execution hierarchy, memory, streams, and synchronization.",
+        "required": true
+      },
+      {
+        "title": "CUDA Best Practices Guide",
+        "url": "https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/",
+        "type": "Documentation",
+        "why": "Use coalescing and occupancy guidance to interpret your own traces.",
+        "required": true
+      },
+      {
+        "title": "GPU MODE: Going Further with CUDA for Python Programmers",
+        "url": "https://www.youtube.com/watch?v=wVsR-YhaHlM",
+        "type": "Video",
+        "why": "Lecture 5 connects shared memory and tiling with runnable matrix examples.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Assignment 1 (ZIP)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/assignment_1.zip",
+        "type": "Course",
+        "why": "Optional original homework: arithmetic-intensity notebooks and a Mixtral training optimization challenge. The full challenge specifies 8 H100s; use the smaller analysis track if needed.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — lecture playlist (access restricted)",
+        "url": "https://www.youtube.com/playlist?list=PLnocShPlK-FtamE4EYyDvPCKGT0DAJOwN",
+        "type": "Video",
+        "why": "Optional if you have access: the course site states a Berkeley email is required. Use the public slides or GPU MODE recordings otherwise.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Profile before optimizing",
+      "path": "labs/09_rmsnorm.py",
+      "command": "python3 labs/09_rmsnorm.py",
+      "task": "On supported Linux NVIDIA hardware with CUDA PyTorch and Triton, run the supplied real RMSNorm kernel and CUDA-event timing. It supports contiguous rows. Learner work: profile it, implement a stride-aware variant, and compare traffic and timing. Without that hardware, complete address derivations and the CPU online-softmax lab without claiming GPU measurements.",
+      "success": "A trace and short report distinguish host gaps from kernel execution and explain at least one layout-dependent performance change."
+    },
+    "completion": [
+      "Write lane-level addresses for a kernel you profiled.",
+      "Separate device event time from host submission time.",
+      "Explain a measured change using traffic, residency, or synchronization evidence."
+    ]
+  },
+  {
+    "id": "05",
+    "slug": "reduce-before-you-optimize",
+    "title": "RMSNorm, reductions, and fusion",
+    "subtitle": "A small operator teaches the hardest habits of kernel engineering.",
+    "phase": 2,
+    "week": 5,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "1 GPU",
+    "tags": [
+      "RMSNorm",
+      "reductions",
+      "fusion"
+    ],
+    "outcomes": [
+      "Derive RMSNorm and implement a numerically stable row reduction.",
+      "Handle masking, odd widths, accumulation dtype, and strides correctly.",
+      "Estimate a fusion benefit and verify it across decode and prefill shapes."
+    ],
+    "body": "## A reduction is a communication problem\n\nAn elementwise operation can produce each output independently. A reduction cannot: every output depends on information gathered from many elements. RMSNorm is an ideal first serious kernel because its formula is compact while its implementation exposes load patterns, cross-thread communication, masking, numerical precision, and register pressure.\n\nFor a row $x\\in\\mathbb{R}^d$, learned weight $w$, and positive stabilizer $\\epsilon$, define\n\n$$r=\\left(\\frac{1}{d}\\sum_{j=1}^{d}x_j^2+\\epsilon\\right)^{-1/2},\\qquad y_j=x_jrw_j.$$\n\nThe [RMSNorm paper](https://arxiv.org/abs/1910.07467) studies normalization without subtracting a mean. That omission is semantic. Replacing RMSNorm with LayerNorm because a library primitive is convenient changes the model. The epsilon placement also matters: adding epsilon after a square root is a different function.\n\nTake $x=[3,4]$, $w=[1,1]$, and set epsilon to zero for this hand calculation. Mean square is 12.5, reciprocal RMS is approximately 0.2828427, and output is approximately $[0.8485281,1.1313708]$. Its mean square is one, while its mean is not zero. This tiny example is a better first unit test than a random 4096-wide tensor because you can see exactly which operation was implemented.\n\n## Reduce locally, combine carefully\n\nA straightforward GPU decomposition assigns a row to a block or program. Threads load disjoint slices, form local sums of squares, combine their partial sums, broadcast the reciprocal RMS, and write scaled outputs. A tree reduction requires logarithmic synchronization depth rather than sequentially adding every element in one thread. The tree also changes floating-point addition order, so bitwise agreement with a sequential sum is not generally expected.\n\nFor low-precision inputs, promote values before squaring and accumulate in a wider type, commonly FP32. Squaring in FP16 and casting the result afterward cannot undo overflow that already happened. The placement of casts is part of the algorithm. Extremely large FP32 inputs can still overflow a naive square, so define the supported input range and test it; wider accumulation is not an unlimited numerical guarantee.\n\nMany educational kernels pad a row to a convenient reduction width. If $d=3000$ and the reduction handles 4096 lanes, masked loads should contribute zero to the sum, while the divisor remains 3000. Dividing by 4096 produces an error on every output even though the padding itself never appears in the output tensor. This is a classic case where random tolerance tests can disguise a systematic mathematical bug.\n\n## Count memory traffic before fusing\n\nA fused row kernel can load $x$, compute its statistic, load $w$, and write $y$ without writing intermediate squared values or sums for later kernels. For two-byte input, weights, and output, a simple logical traffic count is six bytes per element if weights are counted once per row. Reuse of $w$ across rows may reduce its HBM traffic. Register spills or reloading $x$ can increase traffic. State which count you mean.\n\nSuppose the surrounding block first computes $z=x+residual$ and then normalizes $z$. Two separate kernels write $z$ and read it back. Fusing them can remove that intermediate round trip if no other consumer requires $z$. If the residual stream must preserve $z$ for a later branch, the fused kernel may still need to store it, but can avoid rereading it for normalization. Fusion profitability depends on the full dataflow, not the names of adjacent operators.\n\nFor one million two-byte elements, eliminating one write plus one read saves four million bytes. At a hypothetical sustained bandwidth of 0.8 TB/s, that saves an ideal five microseconds of traffic time. The actual benefit can also include one avoided launch, or it can be reduced by extra register pressure. An arithmetic estimate this small tells you to measure carefully instead of promising a dramatic end-to-end speedup.\n\n## Small and large shapes are different jobs\n\nA single decode row may not occupy enough SMs to saturate device bandwidth. Splitting one row among multiple blocks adds a second-stage reduction and communication; it can help very wide rows but hurt ordinary widths. Many prefill rows provide independent work naturally. One launch configuration need not be optimal for both.\n\nWidths near padding boundaries can cause discontinuities. A row of 4097 elements may require a much larger padded reduction than a row of 4096 in a simple implementation. Register demand rises, occupancy falls, and a seemingly tiny shape change can become a large latency regression. Include these boundaries in your benchmark grid. Also include non-contiguous rows if your interface promises them; otherwise reject unsupported layouts explicitly rather than returning silently incorrect results.\n\nThe [Triton fused-softmax tutorial](https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html) provides an accessible example of row reductions and masked loads. Use its implementation patterns to understand the compiler, then write the RMSNorm expression yourself. Copying a kernel without understanding its shape contract leaves the most important work undone.\n\n## Build a correctness envelope and a performance map\n\nTest zero rows, constant rows, alternating signs, odd widths, large magnitudes, tiny magnitudes, and several epsilon values. Compare absolute and relative error against a high-precision reference, and inspect the worst coordinates. Relative error alone becomes unstable near zero. Add a test that changes the weight vector; all-one weights will not catch a missing affine multiplication.\n\nThe supplied lab includes a real Triton kernel with FP32 reduction, a random-input reference check, and synchronized CUDA-event timing. It requires compatible Linux NVIDIA hardware; adversarial inputs, stride support, and residual fusion are your extensions. Your extension should benchmark the unfused framework expression, your fused normalization, and residual-plus-normalization where semantically applicable. Warm up compilation, report steady-state time separately from first call, and show a shape-by-shape table. End with an Amdahl calculation: if RMSNorm is four percent of model latency, even infinitely fast normalization yields at most $1/0.96\\approx1.042$ end-to-end speedup. A good kernel is a building block; the profile decides its practical value.",
+    "exercises": [
+      {
+        "title": "Catch the padded-divisor bug",
+        "prompt": "A row has 3000 entries, all equal to 2, and epsilon is zero. A padded kernel reduces 4096 slots with masked zeros but divides by 4096. Derive the output with w=1.",
+        "hint": "The squared sum is 12,000 in both implementations.",
+        "solution": "Correct RMS is 2, so every output is 1. The buggy RMS is sqrt(12000/4096), and each output is sqrt(4096/3000), about 1.1685. The zero padding is correct; the denominator is wrong."
+      },
+      {
+        "title": "Price a residual fusion",
+        "prompt": "For N=2,000,000 BF16 elements, separate addition writes z and normalization reads z. If z must remain available after normalization, how many logical bytes can fusion still eliminate?",
+        "hint": "The residual output write remains required; only the normalization reread is removed.",
+        "solution": "Fusion can save one read of z: 2N=4,000,000 bytes. If z had no other consumer, it could also remove the write and save 8,000,000 bytes total. Count x, residual, w, and y separately; this is only the intermediate-traffic delta."
+      },
+      {
+        "title": "Establish an error budget",
+        "prompt": "Implement a reference that promotes x before squaring. Design tests that distinguish wrong epsilon placement, low-precision overflow, and a missing weight multiply.",
+        "hint": "Construct cases targeted at one failure, rather than relying only on random normal inputs.",
+        "solution": "Use a near-zero row with substantial epsilon to distinguish sqrt(mean_square+eps) from sqrt(mean_square)+eps. Use FP16-representable x with x² outside FP16 range to catch squaring before promotion. Use nonuniform weights including zero and negative values to catch missing or misplaced affine scaling. Report max absolute error and a relative metric with a denominator floor, using tighter expectations for FP32 than reduced-precision outputs."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Why must a masked RMSNorm reduction divide by the true row width?",
+        "options": [
+          "Padding changes the learned weight size.",
+          "Masked values are all ones.",
+          "The divisor must always be a power of two.",
+          "The desired mean is over valid elements, not padded storage."
+        ],
+        "answer": 3,
+        "explanation": "Zero-filled padding preserves the sum of squares, but the mathematical mean still divides by the number of valid elements. Dividing a 3000-element row by 4096 instead scales every result by an incorrect factor even though masked values never reach the output."
+      },
+      {
+        "question": "Which expression prevents FP16 squaring overflow when inputs are promoted?",
+        "options": [
+          "sum((x*x).float())",
+          "float(sum(x*x))",
+          "sum(x*x).half()",
+          "sum(x.float()*x.float())"
+        ],
+        "answer": 3,
+        "explanation": "The operands must be promoted before multiplication so the square is computed in FP32. Casting an FP16 product after it has overflowed preserves the infinity; a later wide reduction cannot recover the original value."
+      },
+      {
+        "question": "When may residual-plus-RMSNorm fusion remove both a write and a read of the intermediate?",
+        "options": [
+          "When no other consumer needs that intermediate and it can stay on chip.",
+          "Whenever the tensors are BF16.",
+          "Whenever the model has more than one layer.",
+          "Only when epsilon is zero."
+        ],
+        "answer": 0,
+        "explanation": "Both transfers disappear only when the intermediate has no other consumer and can remain on chip until normalization finishes. If a residual branch still needs the intermediate, its write remains necessary even though the normalization reread may be avoidable."
+      },
+      {
+        "question": "RMSNorm accounts for 10% of latency and is made twice as fast. What is the ideal end-to-end speedup?",
+        "options": [
+          "1/0.95 ≈ 1.053×",
+          "1.5×",
+          "10×",
+          "2×"
+        ],
+        "answer": 0,
+        "explanation": "The unchanged 90% still takes 0.9 normalized time, and the optimized part takes 0.1/2=0.05. Total time is 0.95, so speedup is 1/0.95≈1.053×; the operator’s 2× gain does not apply to the whole model."
+      },
+      {
+        "question": "Why test widths 4096 and 4097 in a padded reduction kernel?",
+        "options": [
+          "They have identical allocation and must have identical time.",
+          "4097 is an invalid model width by definition.",
+          "Crossing a padding boundary can change register use and launch efficiency sharply.",
+          "It guarantees tensor-core use."
+        ],
+        "answer": 2,
+        "explanation": "A simple power-of-two reduction may pad 4096 elements to 4096 slots but 4097 elements to 8192 slots. That discontinuity can increase register demand or change residency sharply, so neighboring mathematical shapes need not have neighboring execution times."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Root Mean Square Layer Normalization",
+        "url": "https://arxiv.org/abs/1910.07467",
+        "type": "Paper",
+        "why": "Read the actual normalization semantics before implementing.",
+        "required": true
+      },
+      {
+        "title": "Triton fused softmax tutorial",
+        "url": "https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html",
+        "type": "Documentation",
+        "why": "Study row reductions, masking, and resource-sensitive launch choices.",
+        "required": true
+      },
+      {
+        "title": "GPU MODE lecture materials: fused kernels and RMSNorm",
+        "url": "https://github.com/gpu-mode/lectures",
+        "type": "Repository",
+        "why": "Use lectures 18 and 28 for additional kernel engineering examples.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "A correct normalization kernel",
+      "path": "labs/09_rmsnorm.py",
+      "command": "python3 labs/09_rmsnorm.py",
+      "task": "Run the supplied Triton RMSNorm kernel, FP32-reference correctness check, and CUDA-event benchmark on supported Linux NVIDIA hardware. Learner work: add adversarial inputs, residual fusion, stride support, and shape sweeps. The supplied random-input check is a starting point, not the full correctness envelope.",
+      "success": "All adversarial correctness cases pass with stated tolerances, and the report explains both wins and regressions against the reference."
+    },
+    "completion": [
+      "Pass targeted precision and padding tests.",
+      "Account for every intermediate memory read/write removed by fusion.",
+      "Relate kernel speedup to measured end-to-end opportunity."
+    ]
+  },
+  {
+    "id": "06",
+    "slug": "gemm-is-reuse",
+    "title": "GEMM tiling and the economics of quantization",
+    "subtitle": "Low bits help only when the data path makes them cheap.",
+    "phase": 2,
+    "week": 6,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "1 GPU",
+    "tags": [
+      "GEMM",
+      "tiling",
+      "quantization"
+    ],
+    "outcomes": [
+      "Derive a tiled GEMM’s reuse and resource requirements.",
+      "Separate storage precision, multiply precision, and accumulation precision.",
+      "Evaluate quantization with numerical, behavioral, and performance evidence."
+    ],
+    "body": "## Matrix multiplication is organized reuse\n\nFor $C=AB$ with shapes $[M,K]$ and $[K,N]$, arithmetic is approximately $2MNK$ FLOPs. The interesting question is how many times each input crosses an expensive memory boundary. A naive implementation can reload an element of $A$ for every output column and an element of $B$ for every output row. A tiled implementation retains input fragments while accumulating many outputs. The mathematical operation is unchanged; the movement schedule is transformed.\n\nTake an output tile of $M_t\\times N_t$ and a reduction slice of width $K_t$. It performs $2M_tN_tK_t$ FLOPs after loading $M_tK_t+K_tN_t$ input elements, ignoring the output accumulator's eventual store. For two-byte inputs, the slice arithmetic intensity relative to those loads is\n\n$$I_{tile}=\\frac{M_tN_t}{M_t+N_t}\\;\\text{FLOP/byte}.$$\n\nA $64\\times64$ tile yields 32 FLOP/byte by this local count. A $128\\times128$ tile yields 64. Larger tiles buy reuse, but also require more accumulators and staged operands. The number of FP32 accumulator values grows as $M_tN_t$; the apparent free lunch consumes registers and scheduling flexibility.\n\n## Decode and prefill demand different tiles\n\nIn a projection, $M$ is the number of token rows. A long prefill can expose thousands of rows. Single-request decode has $M=1$. A tile designed for $M_t=128$ cannot create 128 useful rows from one token. Padding and masked work can waste arithmetic, while an alternative GEMV-like path may use the machine differently. This is why a large square GEMM benchmark is weak evidence for a decode optimization.\n\nChoose representative shapes before tuning. Include tiny $M$, moderate batched decode, long prefill, nonmultiple dimensions, and the real model's $K$ and $N$. Compare output correctness before timing, and compare with a tuned library baseline under the same dtype and precision settings. A naive Python loop is an educational baseline, not the performance competitor a research claim requires.\n\nThe [Triton matrix-multiplication tutorial](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html) demonstrates tiling, pointer arithmetic, and tuning. Study how it handles edges and output ownership. Each output element must be written exactly once unless your algorithm intentionally uses a correct reduction across partial outputs.\n\n## Quantization inserts a codec into the data path\n\nA simple symmetric integer quantizer maps $x$ to $q=\\operatorname{clip}(\\operatorname{round}(x/s),-q_{max},q_{max})$, then reconstructs $\\hat{x}=sq$. A per-tensor scale is cheap to store but must accommodate all values. Per-channel or group scales can preserve smaller values better while adding metadata, indexing, and dequantization work. A numeric format is therefore only one part of a runtime design.\n\nConsider a group $[-1,-0.3,0.2,0.9]$ quantized with a symmetric range $[-7,7]$ and scale $1/7$. Rounded integers are $[-7,-2,1,6]$, reconstructing approximately $[-1,-0.2857,0.1429,0.8571]$. The largest error is about 0.0571. If an outlier of magnitude ten shares this scale, the ordinary values lose much more resolution. Grouping and calibration decisions determine which values compete for representable levels.\n\nSuppose four-bit weights use one two-byte scale per group of 128 values. Ignoring packing alignment and zero points, storage is $0.5+2/128=0.515625$ bytes per weight. Relative to two-byte BF16 this is about $3.88\\times$ smaller, not exactly $4\\times$. Additional metadata or padding reduces the ratio further. Storage reduction is exact arithmetic under the chosen format; latency reduction remains an experiment.\n\n## Three precisions, three consequences\n\nStorage precision controls memory footprint and transfer bytes. Multiplication precision controls the arithmetic primitive selected. Accumulation precision controls the running sum's numerical behavior. Weight-only quantization may unpack low-bit weights and multiply them with higher-precision activations. Another path may quantize both inputs and use native low-precision matrix instructions. These paths can have different throughput even when their checkpoints occupy the same disk space.\n\nIf a workload is strongly weight-bandwidth-limited, compressed weights can help even with dequantization overhead. At larger batch sizes, arithmetic or unpacking can dominate and the same format can lose. If the runtime expands the entire matrix back to BF16 in device memory before every multiply, it may sacrifice much of the intended bandwidth benefit. Inspect the actual kernel path rather than inferring it from the model file extension.\n\nThe [SmoothQuant paper](https://arxiv.org/abs/2211.10438) is a useful example of moving numerical difficulty between activations and weights through an equivalent rescaling before quantization. Read it as an example of co-design: a favorable error distribution must meet an efficient hardware path. Do not assume its reported outcomes transfer to a new architecture or calibration distribution.\n\n## Validate the whole approximation\n\nStart with elementwise reconstruction error, then matrix-output error, then model logits or loss, and finally relevant task behavior. Small average weight error can concentrate in important channels. A tiny logit change can change a sampled token, after which generated sequences diverge; that does not by itself prove catastrophic quality loss. Use paired evaluation with a fixed dataset and declared metrics rather than judging one answer.\n\nThe supplied quantization lab is a numerical reference, not an optimized low-bit GPU implementation. Extend it with outlier-heavy and shifted-distribution inputs, group-size sweeps, and a storage ledger. On a supported GPU, benchmark the actual packed kernel separately from the reference reconstruction path. Record calibration data provenance, model revision, format, group size, scale dtype, accumulation dtype, and quality tolerance. Your final decision should state a region: which shapes and quality requirements justify the codec, and which do not. “Four bits is faster” is a slogan; a mapped tradeoff is engineering.",
+    "exercises": [
+      {
+        "title": "Compute local tile intensity",
+        "prompt": "For two-byte inputs, compare 32×128 and 64×64 output tiles at the same K_t. Ignore accumulator stores and inter-tile cache reuse.",
+        "hint": "Use M_t N_t/(M_t+N_t).",
+        "solution": "The rectangular tile has 4096/160=25.6 FLOP/byte; the square tile has 4096/128=32 FLOP/byte. Both have 4096 accumulators. The square has better local input reuse, but shape compatibility, occupancy, and hardware instruction layout can still favor the rectangle."
+      },
+      {
+        "title": "Price metadata honestly",
+        "prompt": "A four-bit format uses groups of 64 weights, one FP16 scale and one FP16 offset per group. Compute effective bytes per weight and ideal storage reduction relative to BF16.",
+        "hint": "Add four metadata bytes per group to the packed payload.",
+        "solution": "Effective size is 0.5+4/64=0.5625 bytes/weight, giving 2/0.5625≈3.556× reduction. Alignment, padding, headers, and unquantized layers can lower whole-model savings. None of this establishes runtime speedup."
+      },
+      {
+        "title": "Construct a quantizer that fails on distribution shift",
+        "prompt": "Create calibration data with values mostly in [-1,1], choose a clipping scale from it, then evaluate data containing rare values of magnitude 10. Specify both numerical and end-task measurements.",
+        "hint": "Fixed calibration scales can clip new extremes; recomputing scales during evaluation changes the method.",
+        "solution": "Hold the calibration procedure fixed, record clipping frequency and maximum error on shifted data, and compare matrix output error with the unshifted case. For a model, evaluate paired loss or task scores on both distributions. An adaptive scaling variant is a separate ablation with its own runtime overhead. Report the accuracy-throughput tradeoff rather than selecting only the favorable distribution."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Why might a 128-row GEMM tile perform poorly at single-request decode?",
+        "options": [
+          "Most of its row capacity may be unused or padded.",
+          "Decode requires no multiplication.",
+          "The model weights are not matrices during decode.",
+          "Tensor cores cannot multiply negative values."
+        ],
+        "answer": 0,
+        "explanation": "At single-request decode, M is often one token row, so a 128-row tile can spend most of its row capacity on masked or padded work. Larger tiles help only when useful rows and resource limits allow their reuse advantage to be realized."
+      },
+      {
+        "question": "Which statement about four-bit weights is defensible?",
+        "options": [
+          "They guarantee a fourfold latency improvement.",
+          "They always use four-bit accumulators.",
+          "They eliminate KV memory.",
+          "Their storage savings depend on metadata and packing, while speed depends on the execution path."
+        ],
+        "answer": 3,
+        "explanation": "Packed values still need scales, possible offsets, alignment, and unquantized tensors, so whole-model storage savings are not automatically exactly fourfold. Runtime speed also depends on unpacking, the multiplication path, accumulation dtype, and whether the workload is limited by weight traffic."
+      },
+      {
+        "question": "A tensor has one large outlier and many small values. What can per-group scales improve?",
+        "options": [
+          "Resolution for groups without the outlier, at metadata and implementation cost.",
+          "The exactness of all rounded values without any cost.",
+          "The number of model layers.",
+          "The theoretical count of matrix multiplications."
+        ],
+        "answer": 0,
+        "explanation": "A separate scale lets groups without the outlier devote their quantization levels to the smaller local range. This improves their resolution but costs scale metadata and implementation work; it does not make rounding exact or eliminate the outlier’s own difficulty."
+      },
+      {
+        "question": "Which baseline best supports a GPU GEMM speed claim?",
+        "options": [
+          "A scalar Python triple loop.",
+          "Disk-loading time of the checkpoint.",
+          "A tuned library implementation with matched shapes and precision settings.",
+          "A different GPU using a different dtype."
+        ],
+        "answer": 2,
+        "explanation": "A tuned library on the same GPU, shapes, dtype, and precision settings controls the main factors behind GEMM performance. Beating a scalar Python loop demonstrates parallelization, but does not establish an improvement over a competitive inference implementation."
+      },
+      {
+        "question": "Why can low mean weight reconstruction error fail to guarantee model quality?",
+        "options": [
+          "Errors can concentrate in sensitive directions and compound through computation.",
+          "Sampling removes numerical error.",
+          "All weights affect outputs identically.",
+          "Quantization never changes logits."
+        ],
+        "answer": 0,
+        "explanation": "Weight error is transformed by the input distribution and by subsequent layers, so equal elementwise errors can have very different effects. Error concentrated in a sensitive channel can matter more than a larger error elsewhere; test matrix outputs and downstream quality as well as reconstruction averages."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Triton matrix multiplication",
+        "url": "https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html",
+        "type": "Documentation",
+        "why": "Implement tiled GEMM with explicit shape and stride reasoning.",
+        "required": true
+      },
+      {
+        "title": "SmoothQuant",
+        "url": "https://arxiv.org/abs/2211.10438",
+        "type": "Paper",
+        "why": "Study the connection between activation outliers, rescaling, and an efficient numeric path.",
+        "required": true
+      },
+      {
+        "title": "GPU MODE: Going Further with CUDA for Python Programmers",
+        "url": "https://www.youtube.com/watch?v=wVsR-YhaHlM",
+        "type": "Video",
+        "why": "Use the shared-memory matrix multiplication explanation before tuning.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Assignment 1 (ZIP)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/assignment_1.zip",
+        "type": "Course",
+        "why": "Optional original homework: arithmetic-intensity notebooks and a Mixtral training optimization challenge. The full challenge specifies 8 H100s; use the smaller analysis track if needed.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Quantization is an experiment",
+      "path": "labs/05_quantization.py",
+      "command": "python3 labs/05_quantization.py",
+      "task": "Run the supplied numerical reference. Learner extensions: group-size and outlier sweeps, metadata accounting, and a separate benchmark of a real packed GPU implementation.",
+      "success": "A report distinguishes storage, reconstruction error, downstream quality, and measured kernel latency without labeling dequantize-then-matmul as a native low-bit kernel."
+    },
+    "completion": [
+      "Derive a tile reuse estimate and test one counterexample to bigger-is-better.",
+      "Measure metadata-inclusive storage.",
+      "Publish a quantization quality/performance tradeoff with a failure case."
+    ]
+  },
+  {
+    "id": "07",
+    "slug": "attention-without-the-matrix",
+    "title": "Attention without the attention matrix",
+    "subtitle": "Derive online softmax, then turn the algebra into an IO schedule.",
+    "phase": 2,
+    "week": 7,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "online softmax",
+      "FlashAttention",
+      "numerics"
+    ],
+    "outcomes": [
+      "Derive and implement stable mergeable softmax statistics.",
+      "Explain why exact attention need not materialize a quadratic score tensor.",
+      "Test mask semantics and understand when decode requires a different parallelization."
+    ],
+    "body": "## The attention matrix is an intermediate, not a requirement\n\nFor one query $q$, keys $k_j$, and values $v_j$, attention returns a weighted average. Scores are $s_j=q^Tk_j/\\sqrt{d_h}$, weights are proportional to $e^{s_j}$, and the result is $\\sum_j e^{s_j}v_j/\\sum_j e^{s_j}$. The output needs a numerator vector and a denominator scalar. It does not fundamentally require keeping every normalized weight in device memory.\n\nThe obstacle is stability. Computing $e^{s_j}$ directly can overflow for large scores. Standard stable softmax subtracts the maximum score, but that maximum seems to require seeing the whole row before processing it. Online softmax resolves the apparent conflict by maintaining statistics that can be rescaled whenever a larger maximum appears. This algebra is the key intuition behind an IO-aware attention implementation.\n\n## Three statistics summarize a block\n\nFor a set of score/value pairs $A$, define\n\n$$m_A=\\max_{j\\in A}s_j,\\quad \\ell_A=\\sum_{j\\in A}e^{s_j-m_A},\\quad u_A=\\sum_{j\\in A}e^{s_j-m_A}v_j.$$\n\nThe output for that set is $u_A/\\ell_A$. To merge disjoint sets $A$ and $B$, choose $m=\\max(m_A,m_B)$ and compute\n\n$$\\ell=e^{m_A-m}\\ell_A+e^{m_B-m}\\ell_B,$$\n\n$$u=e^{m_A-m}u_A+e^{m_B-m}u_B.$$\n\nThe scale factors express both partial sums in a common coordinate system. In exact arithmetic the merge produces the same normalized weighted average as processing the combined set. Floating-point execution changes reduction order, so “exact attention” describes the mathematical algorithm, not necessarily bitwise identity across implementations.\n\nWork a small example with scores $[0,\\log 2,\\log 4]$ and scalar values $[1,3,5]$. Process the first two items: $m_A=\\log2$, $\\ell_A=1.5$, and $u_A=3.5$. The third item has $m_B=\\log4$, $\\ell_B=1$, and $u_B=5$. Merge at $m=\\log4$: $\\ell=0.5(1.5)+1=1.75$ and $u=0.5(3.5)+5=6.75$. The output is $27/7\\approx3.85714$, equal to $(1+2\\times3+4\\times5)/(1+2+4)$.\n\n## Replace a materialized matrix with a tiled schedule\n\nFor many queries, load a tile of query rows and stream through key/value tiles. Compute a score tile, apply the appropriate mask, update each query's running maximum, denominator, and numerator, then discard the score tile. After all relevant key tiles, divide numerator by denominator and write outputs. The intermediate stays in fast storage rather than becoming a full $S\\times S$ tensor in HBM.\n\nFor sequence length 8192 and 32 query heads, storing a full square score tensor at two bytes per entry would require $8192^2\\times32\\times2=4,294,967,296$ bytes: four GiB for one batch element. A tiled implementation avoids that full intermediate. It still performs the attention arithmetic and must store inputs, outputs, and running statistics. Reduced auxiliary memory is not equivalent to linear attention compute.\n\n[FlashAttention](https://arxiv.org/abs/2205.14135) develops this IO-aware organization. [FlashAttention-2](https://arxiv.org/abs/2307.08691) emphasizes that work partitioning also matters: the right algebra can still suffer from insufficient parallel work or expensive communication. Treat mathematical memory savings and device execution efficiency as separate achievements.\n\n## Masks are part of the computation\n\nFor causal self-attention, query position $i$ may consume keys at positions $j\\leq i$. Chunked prefill must account for the query's global offset; a chunk-local lower-triangular mask alone can mis-handle cached history. Padding masks must exclude invalid cache slots. If you represent excluded scores by negative infinity, special-case a row with no valid keys: subtracting negative infinity from negative infinity yields an undefined numeric expression.\n\nA robust implementation declares what an all-masked row means. It might return zeros if that matches the caller's contract, or reject an invalid input. Do not let accidental NaNs choose the semantics. Similarly, scale the score by $1/\\sqrt{d_h}$ at the intended point and preserve the model's positional or bias terms. A numerically perfect softmax on the wrong scores is still wrong attention.\n\n```python\n# Scalar-score pseudocode: numerator may be a vector.\nnew_max = max(running_max, block_max)\na = exp(running_max - new_max)\nb = exp(block_max - new_max)\nrunning_sum = a * running_sum + b * block_sum\nrunning_num = a * running_num + b * block_num\nrunning_max = new_max\n```\n\nInitialize empty state explicitly rather than evaluating invalid empty-set rescalings. Unit-test the merge independently from matrix multiplication so numerical bugs have a small surface area.\n\n## An invariant worth plotting\n\nAfter every processed tile, normalize the current numerator by its current denominator and compare it with a reference attention result restricted to exactly the keys seen so far. The intermediate output need not approach the final answer monotonically; a later high-scoring key can move it sharply. The invariant is equivalence to the processed prefix, not visual smoothness. Plot the running maximum and denominator alongside output error to localize an incorrect rescale immediately.\n\n## Decode has fewer query rows\n\nPrefill exposes many query rows, which can be distributed across blocks. Single-token decode exposes very few. Splitting a long KV history across blocks can create parallelism, but partial outputs must then be merged with their maxima and denominators. Averaging normalized partial outputs is wrong because the partitions generally have different probability mass. The merge equations above make the correct reduction possible.\n\nYour supplied online-softmax lab is a CPU reference that proves the algebra. Extend it to vector values, random partitions, extreme scores, causal masks, and all-masked cases. Verify invariance to partition boundaries within a declared tolerance. For a GPU extension, benchmark short and long contexts separately from query counts, record temporary memory, and compare against a supported fused attention baseline. A useful claim states which shapes improve, whether semantics match, and how much traffic was avoided. The intellectual result is learning to redesign an algorithm around the memory hierarchy while preserving its mathematical contract.",
+    "exercises": [
+      {
+        "title": "Merge probability mass correctly",
+        "prompt": "Partition scores [0,0,log(8)] and values [0,2,10] into the first two items and the final item. Compute each local normalized output, their incorrect unweighted average, and the correct global output.",
+        "hint": "The partitions have unnormalized probability masses two and eight.",
+        "solution": "Local outputs are 1 and 10; their unweighted average is 5.5. Global output is (0+2+80)/(1+1+8)=8.2. Using merge statistics: first block m=0,l=2,u=2; second m=log8,l=1,u=10. Rescale first by 1/8, yielding l=1.25,u=10.25, hence 8.2."
+      },
+      {
+        "title": "Test a numerically hostile row",
+        "prompt": "Compare naive softmax and max-subtracted online softmax for scores [1000,1001,999]. Explain the expected normalized values and what a failure demonstrates.",
+        "hint": "Subtract 1001; the exponentials are exp(-1), 1, and exp(-2).",
+        "solution": "The normalized weights are approximately [0.244728,0.665241,0.090031]. Direct exponentiation overflows in common floating-point formats. Stable offline and online algorithms should agree within tolerance. A failure only for this row suggests unstable exponentiation or incorrect rescaling, rather than attention indexing."
+      },
+      {
+        "title": "Implement split-KV correctness",
+        "prompt": "Split a query’s keys into random partitions, compute partial attention statistics independently, and combine them. Add one all-masked partition and one entirely masked query.",
+        "hint": "Carry maximum, denominator, and unnormalized numerator; empty sets need explicit semantics.",
+        "solution": "For each nonempty partition compute (m,l,u), then merge with common-max rescaling. Skip empty partitions or represent them with an explicit empty flag. For an entirely masked query return the declared contract, such as a zero vector, without evaluating -inf−(-inf). Compare to a full masked reference across random partition orders, lengths, and extreme values; use a numerical tolerance rather than requiring bitwise equality."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Which state is sufficient to merge exact softmax-weighted value aggregates?",
+        "options": [
+          "Maximum, exponential denominator, and unnormalized weighted numerator.",
+          "Only the local maximum.",
+          "Only the local normalized output.",
+          "The number of attention heads only."
+        ],
+        "answer": 0,
+        "explanation": "The maximum supplies the numerical reference scale, the denominator records probability mass on that scale, and the numerator records the correspondingly weighted values. A normalized local output alone loses the relative mass needed to combine partitions correctly."
+      },
+      {
+        "question": "Why is the average of two local attention outputs generally wrong?",
+        "options": [
+          "Every partition has equal weight by definition.",
+          "Attention values are always integers.",
+          "Softmax is linear.",
+          "The partitions can have different total softmax mass."
+        ],
+        "answer": 3,
+        "explanation": "Each local output divides by its own denominator, so an ordinary average incorrectly assigns equal importance to the partitions. If their unnormalized masses are 2 and 8, the combined answer needs a 2:8 weighting after aligning maximum-score scales, not a 1:1 average."
+      },
+      {
+        "question": "What does avoiding the full score matrix guarantee by itself?",
+        "options": [
+          "The full quadratic score intermediate need not be stored.",
+          "Every GPU shape becomes faster.",
+          "All outputs become bitwise identical.",
+          "Attention becomes linear in sequence length."
+        ],
+        "answer": 0,
+        "explanation": "Tiling can keep score blocks on chip and avoid writing the entire S×S intermediate to HBM. It still computes the required query/key interactions for exact dense attention, so reduced storage alone establishes neither linear arithmetic complexity nor a speedup at every shape."
+      },
+      {
+        "question": "What is a specific danger of an all-masked row implemented with -infinity scores?",
+        "options": [
+          "The GPU changes the query dimension.",
+          "The output must equal the unmasked result.",
+          "The cache always becomes smaller.",
+          "Subtracting an all-infinite maximum can create NaNs."
+        ],
+        "answer": 3,
+        "explanation": "If every score is masked to negative infinity, subtracting the row maximum computes negative infinity minus negative infinity, which produces NaN. Define an explicit empty-row behavior, such as a contractually valid zero output or an error, instead of relying on ordinary softmax arithmetic."
+      },
+      {
+        "question": "Why might split-KV parallelization help decode more than prefill?",
+        "options": [
+          "Decode has more query rows than prefill.",
+          "Decode eliminates the need to combine outputs.",
+          "Decode may have too few query rows to expose enough parallel work.",
+          "Prefill never uses a KV representation."
+        ],
+        "answer": 2,
+        "explanation": "Single-token decode may expose only a few query rows, leaving too little independent work to occupy the device. Splitting the KV history creates more tasks, but their results require a correct statistics merge and additional overhead; it is not automatically beneficial at short contexts."
+      }
+    ],
+    "resources": [
+      {
+        "title": "FlashAttention",
+        "url": "https://arxiv.org/abs/2205.14135",
+        "type": "Paper",
+        "why": "Derive the tiled IO schedule after deriving online normalization yourself.",
+        "required": true
+      },
+      {
+        "title": "FlashAttention-2",
+        "url": "https://arxiv.org/abs/2307.08691",
+        "type": "Paper",
+        "why": "Connect algorithmic savings with actual work partitioning.",
+        "required": true
+      },
+      {
+        "title": "Triton fused softmax tutorial",
+        "url": "https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html",
+        "type": "Documentation",
+        "why": "Use a simpler fused reduction as an implementation bridge.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Attention without materializing scores",
+      "path": "labs/04_online_softmax.py",
+      "command": "python3 labs/04_online_softmax.py",
+      "task": "Run the supplied stable CPU reference. Learner extensions: vector values, arbitrary partition merging, all-masked rows, and a tiled GPU attention implementation if hardware permits.",
+      "success": "Partitioned and full attention agree under declared tolerances on adversarial inputs, and any GPU performance claim includes temporary-memory measurements and a tuned baseline."
+    },
+    "completion": [
+      "Re-derive the merge equations without referring to the article.",
+      "Pass extreme-score, partition-order, and mask-boundary tests.",
+      "Explain a case where lower memory use does not imply lower latency."
+    ]
+  },
+  {
+    "id": "08",
+    "slug": "build-the-engine-state-machine",
+    "title": "Build the inference engine state machine",
+    "subtitle": "Correct ownership is the foundation of high throughput.",
+    "phase": 3,
+    "week": 8,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "engine design",
+      "paged KV",
+      "state machines"
+    ],
+    "outcomes": [
+      "Represent request progress independently from physical batch slots.",
+      "Implement page ownership and admission invariants.",
+      "Use randomized traces to validate completion, preemption, and reclamation."
+    ],
+    "body": "## A batch is temporary; a request has a life\n\nA model forward pass consumes tensors and returns tensors. A serving engine manages computations that arrive, pause, grow, finish, or disappear while those tensors are in flight. The difficult abstraction is persistent request identity. A request may occupy batch row three now and row zero next iteration. Its token history, cache mapping, random-number state, output position, and lifecycle must survive that movement.\n\nStart with an explicit request object: identifier, arrival time, prompt tokens, number of computed prompt tokens, generated tokens, logical KV length, page table, sampling state, deadline, and lifecycle status. Separate “tokens known to the host” from “tokens whose KV has been computed.” The newest sampled token often exists before its own KV is computed on the next decode invocation. Conflating these counts produces subtle cache-length errors.\n\nA minimal lifecycle might be queued, prefilling, decoding, retiring, and terminal. Terminal outcomes include completed, cancelled, failed, and rejected. Retiring means no new work should be scheduled but some in-flight work still owns buffers. A single `done` boolean cannot express that distinction cleanly.\n\n## Make one iteration a transaction\n\nAn engine iteration selects runnable work, reserves any required pages, constructs tensor inputs and metadata, launches execution, and commits results after completion. The scheduler should not partially mutate a request and then discover that it cannot allocate the remaining pages. Either preflight all reservations or provide a precise rollback path.\n\nThe selected batch is a view of request state, not its owner. Maintain a mapping from each physical row to request ID and logical token positions. When a request finishes, compacting the next batch should move this mapping alongside every associated tensor. Output tokens, lengths, and sampling state must all be associated by the same identity. A row-number bug can produce fluent text belonging to the wrong request, which ordinary “output looks reasonable” tests will miss.\n\n```python\n# Conceptual iteration contract; actual device execution may be asynchronous.\nplan = scheduler.choose(requests, token_budget, free_pages)\nreservation = cache.reserve(plan)\ntry:\n    result = executor.run(plan, reservation)\n    commit_by_request_id(plan, result)\nexcept Exception:\n    retire_or_rollback(plan, reservation)\n```\n\nThe exception path must distinguish work that never launched from work that may still be executing. Rolling back logical state does not magically stop a device write. This is why retirement belongs in the design before performance optimizations.\n\n## Pages turn sequence growth into local allocation\n\nFor page size $P$, logical token index $t$ maps to logical page $\\lfloor t/P\\rfloor$ and offset $t\\bmod P$. The request's block table maps that logical page to a physical page. Attention follows the table while preserving logical order. The allocator need only provide another page when the valid length crosses a boundary.\n\nTake a pool of eight pages holding four tokens each. Requests of lengths five, eight, and three occupy two, two, and one pages: five pages total. Appending one token to each requires no new page for the five-token request, a new page for the eight-token request, and no new page for the three-token request. Reservation must inspect lengths, not simply assume every active request costs a page per iteration.\n\nThe [PagedAttention paper](https://arxiv.org/abs/2309.06180) motivates this separation between logical sequence state and physical storage. Your educational engine should implement the invariant directly instead of imitating a production allocator's entire feature set. Begin without sharing, then add it only after private-page ownership is correct.\n\n## Admission needs a policy, not an optimistic guess\n\nAllocating only current KV maximizes immediate admission but risks exhausting memory during continued generation. Reserving every request's maximum allowed output length is conservative but can waste capacity. A middle path uses incremental allocation plus an explicit policy for pressure: pause admission, preempt selected requests, evict reusable prefixes, or recompute state later. Each choice affects latency and fairness.\n\nRecomputation is not free, and preemption can create feedback: memory pressure causes recomputation, recomputation consumes GPU time, slower completion retains memory longer, and pressure worsens. Measure preemptions and recomputed tokens per successful request. An engine that reports high GPU utilization while repeatedly redoing work may deliver little useful progress.\n\nChoose a simple first policy: reserve enough pages for the next planned iteration, admit only when that reservation succeeds, and reject requests whose declared maximum context cannot be supported under your stated limits. Then improve the policy experimentally. The point is to make pressure behavior observable and deterministic before making it clever.\n\n## Build a reference execution model\n\nRun each request independently through the tiny decoder with fixed inputs and controlled randomness. Then run the same requests through the batching engine. For greedy decoding, compare per-request logits and output tokens within the chosen numerical contract. For stochastic decoding, isolate random-number streams by request and generation position so unrelated arrivals do not silently change which draws a request receives.\n\nA batch-shape change can still alter floating-point results and therefore sampling decisions. Separate that numerical issue from an indexing or state-ownership bug. First test a deterministic toy executor whose next output encodes request ID and token position. It should survive arbitrary compaction, cancellation, and arrival order exactly. Only after the scheduler passes that test should you integrate GPU numerics.\n\nRead [vLLM's source](https://github.com/vllm-project/vllm) by tracing one request from admission to completion at a pinned commit. Record the functions that own scheduling, cache allocation, execution, and output processing. Do the same later for SGLang; the useful comparison is the placement of responsibilities and invariants, not a contest over which codebase looks familiar.\n\nThe supplied scheduler script demonstrates mixed prefill/decode interference only; the allocator, admission policy, executor, and lifecycle above are the learner project. Your deliverable is an engine whose state can be inspected after every event. Generate seeded random traces with arrivals, short and long prompts, cancellations, and page-boundary crossings. Assert that every request reaches one terminal outcome, no token is delivered twice, no live page is freed, and all unretained pages return. Throughput comes next. Without these properties, faster execution merely creates corrupted state more efficiently.",
+    "exercises": [
+      {
+        "title": "Reserve only the pages actually needed",
+        "prompt": "Pages hold four tokens. Active request KV lengths are [4,7,8,9], and each will compute one new token. How many additional pages are required, assuming their current allocations are minimal?",
+        "hint": "Compare ceil(S/4) and ceil((S+1)/4) for each S.",
+        "solution": "Length 4 needs one new page; 7 needs none; 8 needs one; 9 needs none. Two additional pages are needed. The old allocation is 1+2+2+3=8 pages; the new allocation is 2+2+3+3=10 pages."
+      },
+      {
+        "title": "Find a compaction corruption",
+        "prompt": "Batch rows initially correspond to A, B, C. B finishes, and the next batch contains A, C. A developer compacts token inputs but leaves per-row lengths and RNG states unchanged. Design a test and explain the failure.",
+        "hint": "Use requests with different lengths and deterministic distinguishable outputs.",
+        "solution": "Give B and C different context lengths and use a toy executor that returns request ID plus logical position. After compaction, C receives B’s stale metadata, causing wrong masking, position, or random draws. Assert row-to-request identity for every input, length, output, and RNG handle. Compact via a single index permutation applied to all coupled state, or rebuild metadata from request objects each step."
+      },
+      {
+        "title": "Specify retirement under cancellation",
+        "prompt": "A client cancels after a GPU batch launches but before it completes. Define the state transition, page-release point, and output-delivery behavior.",
+        "hint": "Cancellation changes demand immediately but does not undo launched work.",
+        "solution": "Mark the request retiring and exclude it from future plans. Suppress subsequent client delivery, while retaining pages and output buffers until the in-flight completion event is observed. Then decrement owners and move to cancelled terminal state. Test cancellation before launch, during execution, and immediately after completion; each must yield one terminal outcome and no use-after-free."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Which identity should own persistent cache and sampling state?",
+        "options": [
+          "Current physical batch row.",
+          "The request ID and its logical progress.",
+          "The latest kernel launch number only.",
+          "The client socket’s buffer offset."
+        ],
+        "answer": 1,
+        "explanation": "A request keeps its logical history while the next batch may move it to a different physical row. Storing persistent state by row alone can attach another request’s cache, length, or random draws after compaction."
+      },
+      {
+        "question": "Why distinguish sampled-token count from computed-KV length?",
+        "options": [
+          "Sampling consumes no time.",
+          "KV always has twice as many tokens.",
+          "A token may be sampled before its KV is computed in the next forward step.",
+          "Generated tokens never enter the cache."
+        ],
+        "answer": 2,
+        "explanation": "The final processed position yields logits from which the next token is sampled; that sampled token’s own KV is usually computed on the following forward step. Treating known-token count as computed-cache length can expose an uninitialized cache slot or use an incorrect position."
+      },
+      {
+        "question": "An engine runs out of pages halfway through constructing a batch. What design property prevents inconsistent state?",
+        "options": [
+          "Ignoring the failed request.",
+          "Preflight reservation or a complete rollback/retirement protocol.",
+          "Increasing sampling temperature.",
+          "Reusing a random live page."
+        ],
+        "answer": 1,
+        "explanation": "Planning and allocation must either reserve everything needed before committing or undo every partial mutation consistently. If device work already launched, rollback also needs a retirement protocol because changing host metadata does not stop an in-flight write."
+      },
+      {
+        "question": "Why can preemption reduce useful throughput despite high GPU utilization?",
+        "options": [
+          "GPU utilization directly measures completed requests.",
+          "Preempted requests always disappear.",
+          "All preemption is free.",
+          "The GPU may spend time recomputing state instead of advancing requests."
+        ],
+        "answer": 3,
+        "explanation": "GPU utilization measures activity, including recomputing KV that a prior preemption discarded. Useful throughput counts forward progress toward delivered requests, so repeated recomputation can keep the GPU busy while completion rate deteriorates."
+      },
+      {
+        "question": "What is the best first executor for stress-testing scheduler identities?",
+        "options": [
+          "A large sampled language model judged by fluency.",
+          "A network endpoint with unknown retries.",
+          "A deterministic toy that encodes request identity and logical position.",
+          "An executor that emits the same token for every request."
+        ],
+        "answer": 2,
+        "explanation": "A toy executor that encodes request ID and logical position makes swapped rows or stale metadata produce an exact, recognizable mismatch. A fluent sampled language-model answer can conceal the same ownership bug behind plausible text and numerical variation."
+      }
+    ],
+    "resources": [
+      {
+        "title": "PagedAttention",
+        "url": "https://arxiv.org/abs/2309.06180",
+        "type": "Paper",
+        "why": "Use the logical/physical KV separation to define your own allocator.",
+        "required": true
+      },
+      {
+        "title": "vLLM source",
+        "url": "https://github.com/vllm-project/vllm",
+        "type": "Repository",
+        "why": "Trace admission, scheduling, execution, and output ownership at a pinned commit.",
+        "required": true
+      },
+      {
+        "title": "SGLang source",
+        "url": "https://github.com/sgl-project/sglang",
+        "type": "Repository",
+        "why": "Compare responsibility boundaries after your own minimal engine works.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Inference Frameworks (L18)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture_18.pdf",
+        "type": "Course",
+        "why": "Place your small engine in the broader serving stack; identify which measured costs your implementation omits.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "The engine state machine",
+      "path": "labs/03_scheduler.py",
+      "command": "python3 labs/03_scheduler.py",
+      "task": "The supplied script isolates prefill/decode scheduling interference and has no page allocator, admission control, cancellation, or model executor. Use it as a starting experiment; the learner project is to implement those mechanisms, stable request identity, and terminal outcomes with an identity-encoding fake executor before integrating the tiny decoder.",
+      "success": "Seeded random lifecycle traces preserve every ownership invariant and account for all requests and pages."
+    },
+    "completion": [
+      "Pass random arrival/compaction/cancellation traces.",
+      "Show separate counts for known tokens and computed KV.",
+      "Document admission and memory-pressure behavior with one worked trace."
+    ]
+  },
+  {
+    "id": "09",
+    "slug": "continuous-batching-is-a-scheduling-problem",
+    "title": "Continuous batching and chunked prefill",
+    "subtitle": "Choose who advances at each iteration.",
+    "phase": 3,
+    "week": 9,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "continuous batching",
+      "chunked prefill",
+      "fairness"
+    ],
+    "outcomes": [
+      "Implement iteration-level admission and progress accounting.",
+      "Explain the latency/throughput tradeoff induced by prefill chunks.",
+      "Evaluate fairness and useful throughput under heterogeneous open-loop arrivals."
+    ],
+    "body": "## Stop making short requests wait for long ones\n\nA static batch begins together and remains coupled until the chosen boundary. If one sequence finishes early while another generates a long answer, a rigid implementation can leave useful capacity idle or keep padding finished rows. Continuous batching changes membership at iteration boundaries: completed requests leave, runnable requests continue, and new work enters when resource budgets permit. It converts serving from a sequence of fixed groups into a repeated scheduling decision.\n\nThe word continuous does not mean every request runs continuously. At each iteration, the engine chooses which token computations advance. One request may receive a decode step; another may receive a prompt chunk; a third may wait. The scheduler must preserve causal state while deciding how to spend compute, cache capacity, and latency slack. Those resources are not interchangeable.\n\n## A token budget is a useful approximation\n\nLet an iteration process $n_d$ decode tokens and prompt chunks of lengths $c_1,\\ldots,c_k$. A simple token budget is\n\n$$n_d+\\sum_{i=1}^{k}c_i\\leq T_{max}.$$\n\nThis budget constrains the number of new token rows, which is closely related to projection work. It does not fully constrain attention work: a new token attending to a long history can cost more than one attending to a short history. It also does not guarantee KV allocation succeeds. A practical planner checks both work and memory, and an advanced planner may use an empirical iteration-time model.\n\nStart with a decode-prioritized policy. Give active decode requests one step, then spend remaining token budget on prompt chunks. This protects token cadence under moderate load. Under persistent decode saturation, however, new prefills can starve. Add a waiting-time or deadline mechanism, and measure it. A policy is not fair merely because it is easy to describe.\n\n## Why splitting a prompt helps another user\n\nConsider a deliberately invented iteration model: active decode work costs 4 ms, and adding $c$ prefill tokens adds $0.01c$ ms. Processing a 4096-token prompt at once makes that iteration 44.96 ms. Every ongoing decode request in the batch experiences that long interval. Splitting the prompt into eight 512-token chunks makes each mixed iteration 9.12 ms. The new prompt now completes after 72.96 ms, but existing requests avoid the 44.96-ms interruption.\n\nThese numbers are a teaching model, not GPU measurements. They show the tradeoff cleanly: chunking protects other requests while adding repeated iteration cost and potentially reducing GEMM efficiency. On actual hardware, mixed work can amortize weight traffic, share kernels, and interact nonlinearly. Fit the real cost surface instead of assuming that prefill and decode times always add.\n\n[Sarathi-Serve](https://arxiv.org/abs/2403.02310) is the primary reading for chunked-prefill scheduling. Reproduce the principle with a small system before trying to reproduce a paper's absolute throughput. Workload distributions, hardware, model implementation, and SLO definitions are part of the result.\n\n## Chunking must preserve the original model\n\nA prompt chunk beginning at logical position $a$ must attend to all permitted cached history plus its own causally preceding tokens. Its positional offsets start at $a$, not zero. Finishing a chunk does not finish the prompt unless all prompt tokens have been processed. Sampling from intermediate chunk logits as if the prompt were complete changes the request.\n\nBuild a numerical test comparing unchunked prefill with chunk sizes one, an odd number, and the whole prompt. Compare the final prompt logits and resulting KV state. Then insert decode steps for other requests between chunks and repeat. Scheduling interleaving should not contaminate one request with another's state. This test connects the scheduler to the decoder's mathematical contract.\n\nThe scheduler also needs a progress invariant. Every admitted request should either advance under the policy, wait with an observable reason, or move to a terminal state. A waiting request with no recorded reason is how starvation becomes invisible in dashboards. Track wait age and class-specific latency, especially for long prompts, short prompts, and requests with warm prefixes.\n\n## Choose chunk sizes from evidence\n\nSmall chunks increase scheduling flexibility and may reduce worst interruptions, but introduce more iterations, metadata construction, and potentially less efficient matrix operations. Large chunks improve arithmetic utilization but consume larger latency intervals. The best value depends on the current decode population, history lengths, device, and SLO. A single global chunk size is an understandable baseline, not a universal optimum.\n\nAn adaptive policy can choose the largest chunk predicted to fit an iteration-time budget. Its prediction error matters: underestimation violates cadence, while overestimation wastes useful capacity. Measure the model's error by workload region and keep a conservative fallback. Training a sophisticated predictor on one convenient trace is less valuable than a simple policy with transparent behavior across several traces.\n\n## Evaluate both sides of the bargain\n\nUse the supplied discrete-event lab as a controlled environment. It provides prefill-first and chunked policies with deterministic arrivals and token timestamps, but no KV admission or static-batch implementation. Add the static baseline and admission constraints, then replay the same seeded trace across policies and chunk sizes. Keep prompt lengths, output lengths, termination policy, and cache capacity fixed. Report TTFT for new requests, inter-token gaps for active requests, completed output tokens, useful goodput, waiting time by class, and memory pressure events.\n\n```python\n# Conceptual policy; reserve pages before committing the plan.\nplan = one_decode_step_for_eligible_requests()\nremaining = token_budget - plan.new_token_count\nplan += choose_prefill_chunks(waiting_requests, remaining, fairness_state)\n```\n\nFinally repeat a bounded subset on a real engine. A simulation demonstrates policy consequences under its assumed costs; hardware validates whether those costs and interactions are plausible. The week's deliverable should include a counterexample where your preferred policy loses. If you cannot find one, you probably have not stressed the relevant workload. Scheduling expertise means knowing which objective a decision improves, who pays for it, and when the decision should change.",
+    "exercises": [
+      {
+        "title": "Calculate the chunking tradeoff",
+        "prompt": "Using iteration time 4+0.01c ms, compare a 2048-token prompt processed at once with four 512-token chunks. Assume active decodes run in every iteration and ignore all other delays.",
+        "hint": "Compute both the largest decode gap and time until the prompt is fully processed.",
+        "solution": "One chunk gives a 24.48-ms mixed iteration and prompt completion at 24.48 ms. Four chunks each take 9.12 ms, completing the prompt at 36.48 ms. The maximum induced decode gap falls from 24.48 to 9.12 ms while prompt completion is 12 ms later. These are model predictions, not measured GPU times."
+      },
+      {
+        "title": "Expose decode-priority starvation",
+        "prompt": "A scheduler has a 32-token budget and always schedules 32 active decodes before prefills. Construct an arrival trace where new prompts never run. Propose and evaluate a remedy.",
+        "hint": "Maintain a steady decode population with long outputs.",
+        "solution": "Start 32 long decodes and admit additional prompts while none complete. Strict decode priority leaves zero prefill budget. A remedy reserves some budget for aged prefills or rotates decode eligibility under an explicit cadence SLO. Measure both max prefill wait and decode ITL; the fix must reveal its cost rather than claiming fairness is free."
+      },
+      {
+        "title": "Test chunked-prefill equivalence",
+        "prompt": "Define a test matrix for a 37-token prompt with chunk sizes 1, 7, 16, and 37, interleaved with a second request. State exactly what outputs must match.",
+        "hint": "Global positions, causal masks, and the final prompt state must be invariant.",
+        "solution": "Use fixed weights and deterministic inference. Compare final prompt logits, each layer’s valid KV entries, and several subsequent decode logits against the unchunked reference. Interleave the second request at every chunk boundary with different lengths. Any chunk-local position reset or cross-request cache mapping error should be detected. Use declared floating-point tolerances, and do not sample until the entire prompt has been computed."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "What is the central scheduling unit in continuous batching?",
+        "options": [
+          "The entire lifetime of a fixed batch.",
+          "An iteration’s selected token computations.",
+          "A checkpoint file.",
+          "A whole data center."
+        ],
+        "answer": 1,
+        "explanation": "At each iteration the engine selects which token computations run and can replace finished requests with new work. This does not imply that every admitted request advances every time; the policy and budgets determine who waits."
+      },
+      {
+        "question": "Why does a token budget fail to fully predict iteration time?",
+        "options": [
+          "All tokens have identical history lengths.",
+          "GPU kernels cannot batch tokens.",
+          "Token budgets count only network bytes.",
+          "Attention cost, shapes, and hardware efficiency vary across tokens and requests."
+        ],
+        "answer": 3,
+        "explanation": "New-token count approximates projection rows, but attention also depends on each request’s existing history and implementation. Two iterations with the same token count can have different context lengths, matrix shapes, cache traffic, and therefore different duration."
+      },
+      {
+        "question": "What can happen with strict decode priority under sustained saturation?",
+        "options": [
+          "All prefills automatically become faster.",
+          "KV state becomes exact integers.",
+          "All queues disappear.",
+          "New prefills can starve indefinitely."
+        ],
+        "answer": 3,
+        "explanation": "If active decodes consume all 32 slots of a 32-token budget on every iteration, no waiting prefill receives a token of progress. A fairness or waiting-age mechanism must explicitly reserve or reassign capacity, and its effect on decode cadence must be measured."
+      },
+      {
+        "question": "Chunked prefill begins at position 100. Which positional convention preserves normal causal semantics?",
+        "options": [
+          "Restart positions at zero and ignore history.",
+          "Use global positions beginning at 100 and include permitted earlier cached keys.",
+          "Sample an output after every chunk regardless of prompt completion.",
+          "Use the physical page ID as position."
+        ],
+        "answer": 1,
+        "explanation": "The chunk starts at global position 100 and must see every earlier key allowed by the model’s causal semantics. Restarting positions at zero changes the model computation; chunking should change the execution schedule without changing the logical sequence."
+      },
+      {
+        "question": "A smaller prefill chunk improves decode ITL but worsens TTFT. How should this be reported?",
+        "options": [
+          "As an unconditional speedup.",
+          "As a tradeoff under a declared workload and SLO, including useful throughput.",
+          "As proof the measurement is broken.",
+          "By omitting TTFT."
+        ],
+        "answer": 1,
+        "explanation": "Smaller chunks can interrupt ongoing decode less severely while paying more repeated overhead before a new prompt completes. Report both TTFT and inter-token latency, plus useful throughput under the declared SLO, so the benefit to one population does not conceal its cost to another."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Sarathi-Serve",
+        "url": "https://arxiv.org/abs/2403.02310",
+        "type": "Paper",
+        "why": "Read the chunked-prefill argument and inspect the throughput/latency evaluation.",
+        "required": true
+      },
+      {
+        "title": "vLLM source",
+        "url": "https://github.com/vllm-project/vllm",
+        "type": "Repository",
+        "why": "Trace iteration scheduling and token-budget accounting at a pinned revision.",
+        "required": true
+      },
+      {
+        "title": "SGLang",
+        "url": "https://arxiv.org/abs/2312.07104",
+        "type": "Paper",
+        "why": "Compare how program structure and reusable prefixes interact with scheduling.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Inference Frameworks (L18)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture_18.pdf",
+        "type": "Course",
+        "why": "Place your small engine in the broader serving stack; identify which measured costs your implementation omits.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — vLLM guest lecture (L20)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture_20_1.pdf",
+        "type": "Course",
+        "why": "Compare the released engine architecture with your scheduler and KV ownership model.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Who gets the next iteration?",
+      "path": "labs/03_scheduler.py",
+      "command": "python3 labs/03_scheduler.py --policy chunked --chunk 128 --events",
+      "task": "Compare the supplied prefill-first and chunked policies using --policy, --chunk, and --events. Learner work: add a static-batch baseline, work and KV admission budgets, burst traces, waiting-age fairness, and per-class metrics. Verify numerical chunked-prefill equivalence separately with the decoder; the simulator executes no model.",
+      "success": "Identical seeded traces reveal both benefits and regressions; no request disappears from accounting and no class silently starves."
+    },
+    "completion": [
+      "Show a timeline explaining one mixed prefill/decode schedule.",
+      "Pass chunked-versus-full prefill correctness tests.",
+      "Publish a policy comparison with a concrete losing workload for your preferred policy."
+    ]
+  },
+  {
+    "id": "10",
+    "slug": "reuse-without-stale-state",
+    "title": "Prefix reuse, cancellation, and CUDA graphs",
+    "subtitle": "Make reusable work immutable, identifiable, and safe to retire.",
+    "phase": 3,
+    "week": 10,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "prefix caching",
+      "cancellation",
+      "CUDA graphs"
+    ],
+    "outcomes": [
+      "Define cache identity from the actual model computation.",
+      "Implement reference-counted prefix reuse and cancellation retirement.",
+      "Explain when graph replay saves overhead and when bucketing wastes work."
+    ],
+    "body": "## A prefix hit is a claim about computation\n\nTwo requests can share cached state only if the reused portion would have produced the same state under the same computation. Matching text is not sufficient: tokenization, model revision, adapters, positional conventions, and multimodal inputs can change the result. Matching token IDs is stronger, but still insufficient if the weights or relevant execution semantics differ. A cache key is therefore a compact statement of computational identity.\n\nFor a block-based cache, a useful conceptual key contains the parent-prefix identity, the current block's tokens, and a namespace describing model and adapter state. Parent identity matters because the KV for a token depends on preceding context. Identical token blocks appearing after different histories do not generally have identical KV. The [vLLM prefix-caching design](https://docs.vllm.ai/en/latest/design/prefix_caching/) is a concrete source to study after deriving this requirement.\n\nIn multimodal requests, include a reliable identity for the embedded image, audio, or other input and its preprocessing configuration. A placeholder token saying “image here” does not identify the pixels. Likewise, a cache should not survive a weight update unless its namespace changes or its contents are invalidated. The fastest wrong reuse is still wrong.\n\n## Reuse saves prefix work, not all future work\n\nSuppose a 4096-token prompt shares 3584 tokens with a retained prefix and uses 16-token pages. The shared prefix consists of 224 full pages; 512 prompt tokens remain to be computed. This can substantially reduce prompt processing. Later decode queries still attend to the relevant history under full attention, so a prefix hit does not imply zero cache reads during generation.\n\nMeasure hit rate in more than one way. Request hit rate counts any reuse; token hit rate counts the fraction of prompt tokens reused; avoided-compute estimates may weight tokens by their attention context. A workload where every request hits one short block can have a high request hit rate and little saved work. Report first-token latency and retained memory alongside hit rate so reuse has an observable benefit and cost.\n\n[SGLang](https://arxiv.org/abs/2312.07104) makes prefix reuse a central runtime concern through RadixAttention. The transferable idea is to exploit shared computation while preserving ownership and eviction rules. You need not reproduce a full radix tree to test that idea; immutable block keys and a simple retention policy are enough for a first implementation.\n\n## Sharing and eviction have different ownership rules\n\nDistinguish an active reference from a retention reference. Active requests need the state for correctness. A completed request may leave state retained only because future requests might reuse it. Under pressure, retained but inactive entries are eviction candidates. Active entries are not freely evictable unless the engine supports an explicit recomputation or offload protocol.\n\nReference counts alone do not tell you reuse value. Recency, frequency, prefix length, regeneration cost, and page pressure can inform policy. Start with LRU among evictable entries and measure it against a no-retention baseline. Cache pollution appears when a stream of one-off prompts displaces frequently reused prefixes. A more complex policy earns its place only if it improves useful throughput on representative traces without excessive bookkeeping.\n\nCancellation adds a second time axis: the client stops wanting output before device work necessarily stops using memory. Mark the request inactive for future scheduling immediately, suppress further delivery, and release active references only after its last in-flight operation completes. Then decide whether eligible prefix pages should remain retained. Cancellation and eviction are separate events; tying them together carelessly can either leak memory or destroy useful reuse.\n\n## Graph replay trades dynamism for stable execution structure\n\nCUDA graph capture records a compatible sequence of GPU operations for later replay, reducing repeated host-side submission overhead. In common framework usage, replay relies on stable storage and execution structure; input values can change through buffers prepared for the captured path. Exact restrictions depend on the APIs and implementation. Read the [PyTorch CUDA graph notes](https://docs.pytorch.org/docs/stable/notes/cuda.html) before implementing a concrete capture path.\n\nDynamic serving complicates reuse because batch size, cache tables, and sequence metadata change. One strategy captures a set of batch-size buckets and pads active requests to a supported bucket. With buckets 1, 2, 4, 8, and 16, an active batch of nine uses the 16 bucket. Seven rows are inactive. If cost scaled linearly with rows, that would add about 78% row work relative to nine; actual decode cost often has shared weight traffic, so latency need not scale by that percentage.\n\nPadding must be semantically inert. Dummy rows must not allocate live pages, advance request counters, consume another request's random draws, or emit output. A graph replay that is numerically correct for real rows can still corrupt engine state through dummy-row side effects.\n\n## Compare saved overhead with introduced cost\n\nA simple decision model is\n\n$$\\Delta T=T_{dispatch\\ saved}-T_{padding}-T_{metadata}-T_{extra\\ synchronization}.$$\n\nA positive value favors graph replay under the model. Capture cost and persistent graph memory matter too, especially for short-lived workers or many buckets. Measure cold start separately from warm steady state. Graphs are most compelling when submission overhead is material; they cannot eliminate inherently expensive attention or communication.\n\nThis week's learner extension combines three mechanisms deliberately: reusable immutable prefix pages, cancellation-aware retirement, and a simulated graph-bucket planner. The supplied scheduler isolates scheduling interference; prefix caching, ownership, cancellation, and graph planning are all new learner work. Actual GPU graph capture is also not implemented by that script. Test cache namespace changes, partial-page divergence, cancellation at every lifecycle stage, and dummy rows. Then implement actual graph replay only on supported hardware and compare identical requests with capture disabled. A polished performance optimization has a clear identity contract, a release protocol, and a measured regime where its extra complexity pays for itself.",
+    "exercises": [
+      {
+        "title": "Design a cache key that survives adversarial examples",
+        "prompt": "List fields needed to distinguish identical token blocks after different histories, with different LoRA adapters, and with different images occupying the same placeholder tokens.",
+        "hint": "A block depends on its parent computation, not just its local token bytes.",
+        "solution": "Include parent-prefix identity, token block, model/weight revision, adapter identity/version, and relevant positional/configuration namespace. Include multimodal input identity plus preprocessing/embedding version. Hashing provides a lookup key; define collision handling and the trusted identity source. Tests must force each differing field to prevent reuse while identical computational inputs still hit."
+      },
+      {
+        "title": "Quantify retained-prefix savings",
+        "prompt": "Ten requests share a 1024-token prefix and each has a unique 256-token suffix. Ignoring metadata and partial pages, compare total stored prompt tokens with and without shared prefix pages while all requests are active.",
+        "hint": "The shared prefix is stored once; each suffix remains private.",
+        "solution": "Without sharing: 10×1280=12,800 token states. With sharing: 1024+10×256=3584. Savings are 9216 token states, or 72% of the original payload. Compute savings also depend on which request populated the cache and whether the prefix was already retained."
+      },
+      {
+        "title": "Find the graph-bucket break-even point",
+        "prompt": "An eager batch of nine spends 80 microseconds on dispatch and 400 on GPU work. A bucket-16 replay spends 15 on dispatch, 450 on GPU work, and 10 on metadata updates. Ignore capture amortization. Is replay faster?",
+        "hint": "Compare complete times, not only launch overhead.",
+        "solution": "Eager totals 480 microseconds. Replay totals 475, so the gain is only 5 microseconds or about 1.011×. The 65-microsecond dispatch saving is mostly consumed by 50 more GPU microseconds and 10 metadata microseconds. Capture cost, persistent memory, or measurement noise could reverse this tiny advantage."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Why must a block-cache key depend on the parent prefix?",
+        "options": [
+          "Parent keys reduce the number of model layers.",
+          "Physical pages always have the same ID.",
+          "Token IDs are globally unique sentences.",
+          "The same token block can produce different KV after different preceding context."
+        ],
+        "answer": 3,
+        "explanation": "The hidden state and KV for a token depend on preceding context, so equal local token blocks can represent different computations. Chaining the parent-prefix identity distinguishes those histories; local token bytes alone cannot justify reuse."
+      },
+      {
+        "question": "What does a prefix hit usually avoid?",
+        "options": [
+          "All future attention reads.",
+          "All sampling.",
+          "All output-token projections.",
+          "Recomputing the matching prefix state."
+        ],
+        "answer": 3,
+        "explanation": "A hit avoids recomputing the matching prefix’s state during prompt processing. New generated tokens still run through the model and, for full attention, read relevant cached history, so a prefix hit does not make subsequent decode free."
+      },
+      {
+        "question": "Which retained cache entry can a simple eviction policy reclaim safely?",
+        "options": [
+          "Any entry with many tokens.",
+          "One with no active or in-flight owners, subject to its retention policy.",
+          "Any entry after the client sees the first token.",
+          "Every entry from a cancelled request before GPU completion."
+        ],
+        "answer": 1,
+        "explanation": "An inactive retained entry can be reclaimed only after all active references and asynchronous readers or writers have finished. A client disconnect is not enough: its last launched kernel may still require the page even though no further output will be delivered."
+      },
+      {
+        "question": "Which dummy-row behavior breaks graph-bucket correctness?",
+        "options": [
+          "Using an explicitly masked output.",
+          "Not delivering a dummy token.",
+          "Advancing a real request’s RNG or cache counters.",
+          "Keeping dummy metadata separate."
+        ],
+        "answer": 2,
+        "explanation": "Padding rows are execution scaffolding and must have no effect on live request state. Advancing a real request’s RNG, length, or cache counters changes later results even if the padded row’s immediate output is discarded."
+      },
+      {
+        "question": "What most strongly supports adding CUDA graphs?",
+        "options": [
+          "A high prefix hit rate alone.",
+          "A large checkpoint file.",
+          "A measured host submission bottleneck with replay savings exceeding padding and management costs.",
+          "A claim that graphs eliminate attention FLOPs."
+        ],
+        "answer": 2,
+        "explanation": "Graph replay is justified when measured submission savings exceed padding, metadata updates, extra synchronization, and amortized capture cost. A large model or a high cache-hit rate alone says nothing about that balance; profile the actual host and GPU critical path."
+      }
+    ],
+    "resources": [
+      {
+        "title": "vLLM automatic prefix-caching design",
+        "url": "https://docs.vllm.ai/en/latest/design/prefix_caching/",
+        "type": "Documentation",
+        "why": "Inspect computational block identity, reuse, and cache management.",
+        "required": true
+      },
+      {
+        "title": "SGLang and RadixAttention",
+        "url": "https://arxiv.org/abs/2312.07104",
+        "type": "Paper",
+        "why": "Study structured prefix reuse and its workload assumptions.",
+        "required": true
+      },
+      {
+        "title": "PyTorch CUDA semantics and graphs",
+        "url": "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "type": "Documentation",
+        "why": "Read capture/replay restrictions before implementing hardware graph execution.",
+        "required": true
+      },
+      {
+        "title": "Berkeley Scalable AI — vLLM guest lecture (L20)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture_20_1.pdf",
+        "type": "Course",
+        "why": "Compare the released engine architecture with your scheduler and KV ownership model.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Reuse with explicit ownership",
+      "path": "labs/03_scheduler.py",
+      "command": "python3 labs/03_scheduler.py",
+      "task": "The supplied scheduler models only mixed-work interference. Prefix keys, active and retained page references, cancellation retirement, and graph-bucket costs are all learner extensions. Actual CUDA graph capture is a separate optional GPU extension; none is supplied by the simulation.",
+      "success": "Namespace and cancellation tests preserve correctness; a trace reports useful prefix savings and graph overhead without counting simulation as GPU execution."
+    },
+    "completion": [
+      "Prove identical local tokens with different histories cannot falsely hit.",
+      "Recover cancelled-request active pages only after work completion.",
+      "Show a graph-bucket case that loses after accounting for all overhead."
+    ]
+  },
+  {
+    "id": "11",
+    "slug": "serving-is-a-contract",
+    "title": "Reliable serving is part of performance",
+    "subtitle": "An engine is useful only when it handles overload, cancellation, and failure.",
+    "phase": 3,
+    "week": 11,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "reliability",
+      "goodput",
+      "observability"
+    ],
+    "outcomes": [
+      "Design bounded admission, deadlines, and explicit terminal outcomes.",
+      "Instrument request progress from client arrival to delivered output.",
+      "Evaluate recovery and overload without concealing failed or censored work."
+    ],
+    "body": "## The useful unit is a completed promise\n\nA token emitted by a GPU is not necessarily a token delivered to a user. Tokenization, queueing, model execution, detokenization, buffering, networking, and client consumption lie along the path. A slow consumer can accumulate output buffers even when the GPU is fast. A disconnected client can leave expensive generation running. A retry can duplicate work. A high-performance service must define what it promises and where that promise ends.\n\nBegin with a request contract: model revision, input limits, output limit, timeout or deadline, streaming behavior, and terminal outcomes. Define whether the deadline includes queueing and network delivery. For a client-facing SLO it usually must include the relevant user-visible path. Keep internal execution timing as a separate diagnostic, not a substitute for the service metric.\n\nEach request should reach exactly one recorded terminal outcome. Completion means its defined output finished successfully. Cancellation, rejection, timeout, and execution failure are distinct outcomes because they have different causes and remedies. A benchmark that simply discards all non-completions is measuring the easy survivors.\n\n## Bound queues before they become hidden memory\n\nIf arrival work exceeds service capacity for long enough, a queue grows without bound unless the system rejects, delays upstream, or reduces work. More buffering cannot create compute capacity. It can absorb a short burst, but beyond that it converts overload into latency and memory pressure. Bound admission by estimated work and state requirements, not only request count: one 100,000-token prompt is not equivalent to one 20-token prompt.\n\nA useful first policy has limits for queued requests, queued prompt tokens, active KV pages, and maximum wait age. It rejects work that cannot reasonably meet the declared contract, while recording the reason. A deadline-aware policy may estimate remaining queue delay plus service time, but its estimator must be tested for underprediction. The [Google SRE overload chapter](https://sre.google/sre-book/handling-overload/) supplies general operational principles; the inference-specific resource model comes from your own measurements.\n\nConsider a replica capable of 100 units of work per second. A burst supplies 180 units/s for five seconds, after which load returns to 60. If no work is dropped and the capacity remains constant, the queue accumulates $(180-100)\\times5=400$ units. At the subsequent net drain rate of 40 units/s, clearing it takes ten seconds. A five-second burst can therefore affect users for much longer than five seconds. If retries increase arrival work, recovery can take longer still.\n\n## Retries are new demand\n\nIn a toy independent-failure model with failure probability $p$ per attempt and unlimited retry, expected attempts per successful request are $1/(1-p)$. At $p=0.2$, that is 1.25 attempts: 25% extra demand. Real overload failures are correlated with load, so retries can amplify the condition causing them. Use bounded retries, backoff, jitter, and a deadline budget when those semantics fit the application. Do not retry blindly after streaming partial output without defining how the client should interpret the new attempt.\n\nIdempotency needs precise scope. A request identifier can help a server recognize a repeated submission, but it does not automatically ensure exactly-once token delivery across reconnects. Streaming events need stable sequence positions if a client may resume or deduplicate them. A restarted worker may have lost its KV state. The service must either reconstruct it under a declared policy or report that the stream cannot continue seamlessly.\n\n## Backpressure must reach the expensive work\n\nIf a client reads slowly, an unbounded server-side output queue becomes a memory leak in practice even when every buffer has an eventual owner. Put a bound on buffered output, then choose whether to pause generation, disconnect the slow consumer, or spool under a documented limit. Pausing one request should not block unrelated requests through a global lock or shared queue.\n\nCancellation should propagate from network layer to scheduler to cache retirement. Measure cancellation-to-stop-scheduling time and cancellation-to-resource-release time separately. The latter includes legitimate in-flight work. A server that acknowledges cancellation immediately while generating the entire answer anyway has poor useful efficiency even if its happy-path throughput looks excellent.\n\n## Instrument causes, not only symptoms\n\nFor each request, record timestamps at arrival, queue admission, prefill start/end, token readiness, token delivery, and terminal outcome where available. Use one monotonic clock within a process. Across machines, separate clock-offset uncertainty from actual latency or use trace spans whose boundaries are meaningful without naive timestamp subtraction.\n\nAggregate queue depth, wait age, active sequences, free KV pages, retained prefix pages, preemptions, recomputed tokens, batch sizes, and output-buffer occupancy. A jump in TTFT could come from queueing, cold prefixes, tokenization, or prefill execution. The counters should distinguish those possibilities. Avoid using request IDs as high-cardinality metric labels; preserve detailed identifiers in bounded traces or logs instead.\n\n```python\n# Every offered request must land in exactly one final accounting bucket.\nassert offered == completed + rejected + cancelled + timed_out + failed + outstanding\n```\n\nAt the end of a drained experiment, outstanding should be zero or explicitly censored. Track retry attempts separately from user requests so the accounting does not confuse extra work with additional successful demand.\n\n## Test the failure path while the system is busy\n\nThe supplied scheduler currently completes synthetic requests without admission limits or failure handling. Extend it with injected execution errors, slow consumers, cancellation, and bursts. Then test a real service with bounded fault injection: terminate a worker, force a timeout, disconnect a client, and fill the admission queue. Verify page recovery and exactly one terminal record per request. Measure recovery time and the effect on unrelated requests.\n\nYour report should show goodput under the same quality and latency contract before, during, and after a fault. Include failed requests and retry work in the denominator appropriate to the metric. Separate engine-only speed from delivered-service performance. The exit standard is not that every request succeeds under arbitrary overload; that is impossible with finite resources. It is that the system fails predictably, preserves state integrity, recovers resources, and makes its limitations visible.\n\n## Optional Berkeley application checkoff\n\nThe [Spring 2026 Assignment 4 download](https://scalable-ai.eecs.berkeley.edu/S2026/assets/assignment_4.zip) is titled *Applications*. Its requirements connect backend selection to a usable interface, quality evaluation, system measurements, and a working demonstration. Use it as an external review checklist after implementing your server. For this course, choose the model and hardware justified by your experiment; the Berkeley handout’s allowed-checkpoint rules belong to that assignment. Your original extension is the scheduler dashboard and failure-injection study in Project 01. Publish your own evidence and credit the external brief.",
+    "exercises": [
+      {
+        "title": "Compute burst recovery",
+        "prompt": "A service handles 80 work units/s. Arrivals are 140 units/s for four seconds, then 50 units/s. With no rejection, compute backlog and ideal drain time after the burst.",
+        "hint": "Accumulation and drain use different net rates.",
+        "solution": "Backlog is (140−80)×4=240 units. After the burst, net drain is 80−50=30 units/s, so drain time is eight seconds. Total affected period can extend at least twelve seconds from burst start, and actual latency depends on scheduling and per-request work."
+      },
+      {
+        "title": "Account for every offered request",
+        "prompt": "A run offers 1000 user requests. It records 850 completions, 60 rejections, 30 cancellations, 20 failures, and 25 timeouts. What is missing? How should 100 retry attempts be counted?",
+        "hint": "Terminal outcomes must be disjoint, and attempts are not user requests.",
+        "solution": "Fifteen user requests remain outstanding or unaccounted for because listed outcomes sum to 985. Report them as outstanding/censored until resolved; do not exclude them. The 100 retries increase attempt count to 1100 if each is an additional attempt, but user demand remains 1000. Track attempt failures and request terminal outcomes separately to avoid double counting."
+      },
+      {
+        "title": "Design slow-consumer isolation",
+        "prompt": "Specify a bounded streaming-buffer policy and a test showing one stalled client cannot exhaust memory or stall every request.",
+        "hint": "Backpressure must affect the corresponding generation request.",
+        "solution": "Set a per-request buffer limit and a maximum stall duration. On reaching the limit, pause that request if supported or cancel it with an explicit outcome; preserve bounded bookkeeping. Run one nonreading client alongside several normal clients, verify total buffered bytes stay bounded, normal-client latency remains within the chosen tolerance, and the stalled request’s pages are eventually reclaimed after in-flight work retires."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "What does a longer queue accomplish during sustained overload?",
+        "options": [
+          "It increases GPU compute capacity.",
+          "It can hide overload by converting it into wait time and memory use.",
+          "It guarantees lower p99.",
+          "It removes the need for admission control."
+        ],
+        "answer": 1,
+        "explanation": "A queue can absorb a finite burst, but sustained arrivals above capacity make backlog keep growing. Extra queue space then buys longer waits and more retained state rather than more compute throughput, so bounded admission and explicit outcomes remain necessary."
+      },
+      {
+        "question": "A client disconnects but its GPU work continues to completion. Which metric exposes the waste?",
+        "options": [
+          "Cancellation-to-stop and resource-release latency, plus wasted generated work.",
+          "Only GPU utilization.",
+          "Only checkpoint size.",
+          "Only successful-request median latency."
+        ],
+        "answer": 0,
+        "explanation": "Measure how quickly cancellation stops new scheduling and how quickly already launched work retires and releases pages. Also count abandoned generated tokens: high GPU utilization can otherwise conceal work no client still wants."
+      },
+      {
+        "question": "Why should retries be counted separately from user requests?",
+        "options": [
+          "They consume additional work without necessarily representing new demand.",
+          "They always use zero GPU time.",
+          "They can never fail.",
+          "They remove the original request from history."
+        ],
+        "answer": 0,
+        "explanation": "One user request may create multiple attempts, each consuming resources while contributing at most one user-level success. For example, 100 retries on 1000 original requests mean 1100 attempts, not 1100 independent successful demands; keep both populations visible."
+      },
+      {
+        "question": "What is wrong with reporting p99 only for requests that finished before the benchmark stopped?",
+        "options": [
+          "Nothing; slow requests are irrelevant.",
+          "It censors the slowest work and can make overload appear healthy.",
+          "It necessarily overstates latency.",
+          "It includes too many samples."
+        ],
+        "answer": 1,
+        "explanation": "An overloaded run tends to leave its slowest requests unfinished, so dropping them biases the reported tail toward the faster survivors. Drain the run under a stated timeout or retain unfinished requests as censored outcomes alongside latency results."
+      },
+      {
+        "question": "Which observation most directly supports slow-client isolation?",
+        "options": [
+          "One stalled stream causes all token delivery to pause.",
+          "Total buffered memory grows indefinitely.",
+          "Per-request buffers stay bounded while normal clients retain their declared service quality.",
+          "The GPU remains busy regardless of output demand."
+        ],
+        "answer": 2,
+        "explanation": "The intended property is that one client’s inability to consume output has bounded memory and scheduling consequences. Normal clients must continue meeting the stated service contract while the slow request is paused or terminated and its resources are eventually recovered."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Google SRE: Handling Overload",
+        "url": "https://sre.google/sre-book/handling-overload/",
+        "type": "Documentation",
+        "why": "Use bounded demand, retry behavior, and overload recovery as design concerns.",
+        "required": true
+      },
+      {
+        "title": "vLLM source",
+        "url": "https://github.com/vllm-project/vllm",
+        "type": "Repository",
+        "why": "Trace request aborts and output processing in a real engine.",
+        "required": true
+      },
+      {
+        "title": "SGLang source",
+        "url": "https://github.com/sgl-project/sglang",
+        "type": "Repository",
+        "why": "Compare lifecycle and scheduling choices at a pinned revision.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Inference Frameworks (L18)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture_18.pdf",
+        "type": "Course",
+        "why": "Place your small engine in the broader serving stack; identify which measured costs your implementation omits.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Assignment 4: Applications (ZIP)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/assignment_4.zip",
+        "type": "Course",
+        "why": "Optional project reference: the actual handout asks for an interactive application, a justified serving stack, quality/performance evaluation, and a demo. Keep its original model restrictions distinct from this course.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Faults belong in the benchmark",
+      "path": "labs/03_scheduler.py",
+      "command": "python3 labs/03_scheduler.py",
+      "task": "Begin with the supplied interference simulator, which currently completes every synthetic request and has no failure or admission path. Learner work: implement overload limits, cancellation, timeouts, and bounded slow-consumer behavior, then add a real streaming wrapper and repeat the scenarios there.",
+      "success": "Every request has a recorded outcome, memory recovers after faults, and the report separates useful delivered work from retries and abandoned generation."
+    },
+    "completion": [
+      "Demonstrate bounded queue and output-buffer behavior.",
+      "Pass cancellation and failure cleanup tests under concurrent load.",
+      "Publish a goodput/recovery report that includes all failed and censored work."
+    ]
+  },
+  {
+    "id": "12",
+    "slug": "parallelism-is-a-communication-contract",
+    "title": "Parallelism is a communication contract",
+    "subtitle": "Distribute tensors only after deriving what must move.",
+    "phase": 4,
+    "week": 12,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "2+ GPUs",
+    "tags": [
+      "collectives",
+      "tensor parallelism",
+      "topology"
+    ],
+    "outcomes": [
+      "Derive collectives from tensor partitioning and verify their output layout.",
+      "Estimate latency and bandwidth costs for a declared communication model.",
+      "Choose between replication and model splitting using measured topology and workload."
+    ],
+    "body": "## More GPUs introduce a new critical path\n\nSplitting a model can reduce per-device weight storage and arithmetic. It also creates dependencies across devices. A result that was local becomes a message, and the next operation may wait for it. The right question is not “Which parallelism flag should I use?” It is “Which tensor lives where, and which operation needs information from elsewhere?” Draw those ownership boundaries before launching a cluster.\n\nData parallel inference replicates the model and sends different requests to different replicas. It can improve aggregate capacity when a model fits on one device, but does not automatically speed up one request. Tensor parallelism partitions operations inside layers. Pipeline parallelism partitions layers into stages. Context parallelism partitions sequence-related work. Expert parallelism partitions MoE experts. These dimensions can be combined, but each adds a placement and communication problem.\n\n## Derive a collective from a linear layer\n\nFor $Y=XW$, partition $W$ by output columns: $W=[W_0,W_1]$. Each rank computes $Y_i=XW_i$, which is a different slice of the output. If the next operation can consume that partition directly, no immediate gather is necessary. If it needs full $Y$, an all-gather can assemble the slices. Communication depends on the next consumer, not merely on the current matrix multiply.\n\nNow partition $W$ by input rows and partition $X$ compatibly. Each rank computes a partial contribution $Z_i=X_iW_i$ to the same output coordinates. The complete output is $Y=\\sum_i Z_i$, requiring a reduction. An all-reduce gives every rank the sum; a reduce-scatter gives each rank a shard of that sum when the next operation can remain sharded. This distinction determines both bytes and downstream layout.\n\nThe [Megatron-LM paper](https://arxiv.org/abs/1909.08053) is a foundational example of arranging layer partitions to avoid unnecessary communication. Its subject is training, so derive the inference forward path explicitly rather than copying backward-pass costs into a serving model.\n\n## Know what each primitive promises\n\nAll-reduce combines corresponding values and makes the result available to all ranks. All-gather concatenates rank-owned pieces in a defined rank order. Reduce-scatter reduces corresponding values and distributes output shards. All-to-all sends different pieces to different destinations, which is central to expert token routing. A collective is a data-layout contract, not just a synchronization point.\n\nRead the [NCCL collective semantics](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html) and test tiny distinguishable tensors first. For example, rank zero contributes $[1,2]$ and rank one contributes $[10,20]$. Sum all-reduce should yield $[11,22]$ on both. All-gather should preserve rank ordering rather than add values. This elementary test catches surprisingly expensive misunderstandings before they become multi-GPU model bugs.\n\nAll participants must follow compatible collective ordering and arguments. A rank taking an error branch while others enter a collective can leave the group waiting. Timeouts, failure propagation, and restart scope belong in the runtime design. Adding a barrier everywhere may hide a race while destroying useful overlap; express the actual dependencies instead.\n\n## Build an alpha-bandwidth model\n\nFor an illustrative ring all-reduce with $p$ ranks and $n$ bytes per rank's full input, a common simplified model is\n\n$$T\\approx2(p-1)\\alpha+\\frac{2(p-1)}{p}\\frac{n}{B},$$\n\nwhere $\\alpha$ is per-step startup latency and $B$ is effective per-link transfer bandwidth under this model. Actual libraries may choose different algorithms and protocols depending on message size and topology. The equation is a reasoning tool, not a claim that NCCL always uses a ring.\n\nWith four ranks, $\\alpha=5$ microseconds, $B=50$ decimal GB/s, and $n=16$ MiB, the startup term is 30 microseconds and transfer term approximately 503.3 microseconds. Total is approximately 0.533 ms. At 16 KiB, the transfer term is only about 0.492 microseconds, leaving a total near 30.49 microseconds. Small messages are dominated by repeated startup; large messages expose bandwidth.\n\nIf an architecture requires two such nonoverlapped collectives per layer across 32 layers, the small-message estimate totals about 1.95 ms per forward step. That can be substantial for latency-sensitive decode. Reducing arithmetic by a factor of four does not reduce this startup term by four. A strong scaling curve eventually flattens or reverses as local work shrinks relative to communication.\n\n## Topology is part of the algorithm\n\nAn eight-GPU node is not a uniform abstract device. Links may differ, GPUs may share switches, and crossing nodes adds network and software costs. Effective bandwidth depends on the path, simultaneous traffic, message size, and placement. A vendor aggregate bandwidth number cannot be substituted directly for every rank-to-rank transfer.\n\nMeasure your topology with a collective size sweep using [nccl-tests](https://github.com/NVIDIA/nccl-tests), then measure the application's real communication pattern. Separate latency, algorithm bandwidth, and bus bandwidth according to the tool's definitions. Record rank placement, device interconnect, and node layout. A microbenchmark without concurrent compute may overestimate usable application bandwidth when communication and computation compete for resources.\n\n## Choose a strategy by its losing case\n\nIf a model fits on one GPU and requests are independent, compare two replicas against a two-way tensor-parallel replica under the same total GPU budget. Replication may deliver more aggregate goodput; splitting may reduce a single request's latency or enable larger memory capacity. Neither dominates universally. Pipeline parallelism can have bubbles at small concurrency, while expert parallelism can suffer from skew and many small messages.\n\nUse the supplied MoE routing simulator to understand ownership and traffic, then extend it with an alpha-bandwidth cost model. This is a CPU reasoning lab; actual distributed validation requires two or more compatible GPUs. Build a minimal distributed linear layer, compare its output with a single-device reference, sweep message sizes, and measure strong scaling. Your deliverable is a placement decision with evidence, including one workload where adding GPUs makes the chosen metric worse. That is the beginning of cluster-level inference judgment.",
+    "exercises": [
+      {
+        "title": "Derive two linear-layer partitions",
+        "prompt": "For X=[M,K] and W=[K,N], describe output ownership and required communication when W is partitioned by N versus by K. Assume the next consumer needs full Y on every rank.",
+        "hint": "Column partition produces disjoint outputs; row partition produces partial sums.",
+        "solution": "Partition by N: each rank holds W_i=[K,N/p] and computes Y_i=[M,N/p], so all-gather reconstructs full Y. Partition by K: each rank holds X_i=[M,K/p] and W_i=[K/p,N], computes Z_i=[M,N], and all-reduce sums the contributions. If the next consumer accepts shards, communication can be delayed or changed, which is why whole-block layout matters."
+      },
+      {
+        "title": "Compute a communication floor",
+        "prompt": "Use p=4, alpha=5 microseconds, B=50 GB/s, and n=1 MiB in the illustrative ring model. Then calculate 64 sequential collectives.",
+        "hint": "Use 1 MiB=1,048,576 bytes and retain both startup and transfer.",
+        "solution": "Startup is 30 microseconds. Transfer is 1.5×1,048,576/(50×10^9) seconds=31.45728 microseconds. Total is 61.45728 microseconds; 64 sequential collectives cost about 3.9333 ms. Overlap, another algorithm, and actual topology can change measured time, so this remains a model prediction."
+      },
+      {
+        "title": "Compare replication with tensor parallelism",
+        "prompt": "A model fits on one GPU. Design an experiment comparing two single-GPU replicas with one two-GPU tensor-parallel replica under equal hardware and request traces.",
+        "hint": "Measure both low-load latency and saturation goodput; routing and cache affinity can matter.",
+        "solution": "Use the same checkpoint, precision, quality settings, prompt/output trace, and total two-GPU budget. Measure single-request latency at low load, then open-loop goodput/TTFT/ITL/rejections across offered rates. Record routing, prefix reuse, and total resident memory. Report GPU-seconds per completed useful request. The winner can differ between latency and aggregate capacity; do not collapse them into one unqualified speedup."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Column-partitioning W in Y=XW produces what on each rank?",
+        "options": [
+          "A disjoint slice of output columns.",
+          "The same complete output with different random noise.",
+          "A scalar loss only.",
+          "A full output requiring summation with every other rank."
+        ],
+        "answer": 0,
+        "explanation": "Partitioning W by output columns assigns different coordinates of Y to each rank: rank i computes XW_i. Reconstructing full Y concatenates those slices in the correct order; summing them would combine unrelated output coordinates."
+      },
+      {
+        "question": "What does reduce-scatter provide?",
+        "options": [
+          "A broadcast of one rank’s original buffer.",
+          "A concatenation of all unmodified buffers.",
+          "A reduced result divided into rank-owned shards.",
+          "A guarantee of zero communication."
+        ],
+        "answer": 2,
+        "explanation": "Reduce-scatter first combines corresponding input values across ranks, then leaves each rank with a different shard of the combined result. It is useful when the next operation can remain sharded; an all-gather would concatenate values without performing that reduction."
+      },
+      {
+        "question": "Why can tensor parallelism hurt tiny-batch decode?",
+        "options": [
+          "The model stops using matrices.",
+          "Collective startup and synchronization can dominate the reduced local work.",
+          "Every GPU receives less memory bandwidth.",
+          "It always doubles model quality."
+        ],
+        "answer": 1,
+        "explanation": "Partitioning reduces arithmetic and weight storage per device but introduces or preserves cross-device dependencies. With tiny messages and little local work, repeated collective startup and synchronization can cost more than the compute time saved."
+      },
+      {
+        "question": "Which comparison isolates the benefit of model splitting when a model fits on one GPU?",
+        "options": [
+          "One two-GPU split replica versus two single-GPU replicas under the same total GPU budget and trace.",
+          "A two-GPU run versus an unrelated CPU model.",
+          "Two different precision settings on different workloads.",
+          "Peak interconnect bandwidth versus tokenizer speed."
+        ],
+        "answer": 0,
+        "explanation": "Two independent replicas are an alternative use of the same two GPUs when the model fits on one. Compare both low-load request latency and saturation goodput on an unchanged trace, because splitting may help one objective while replication helps the other."
+      },
+      {
+        "question": "What does the ring alpha-bandwidth equation establish?",
+        "options": [
+          "The exact algorithm chosen by every NCCL release.",
+          "That all-reduce has no startup cost.",
+          "A simplified cost prediction whose topology and algorithm assumptions must be checked.",
+          "That more ranks always reduce latency."
+        ],
+        "answer": 2,
+        "explanation": "The equation predicts the startup and transfer cost of an illustrative ring under stated effective-bandwidth assumptions. NCCL can choose other algorithms or protocols, and real topology or contention changes effective cost; use the formula to generate a testable prediction, not to replace a measurement."
+      }
+    ],
+    "resources": [
+      {
+        "title": "NCCL collective operations",
+        "url": "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html",
+        "type": "Documentation",
+        "why": "Verify semantics, rank ordering, and compatible participation requirements.",
+        "required": true
+      },
+      {
+        "title": "NCCL Tests",
+        "url": "https://github.com/NVIDIA/nccl-tests",
+        "type": "Repository",
+        "why": "Measure message-size behavior and correctness on the actual topology.",
+        "required": true
+      },
+      {
+        "title": "Megatron-LM",
+        "url": "https://arxiv.org/abs/1909.08053",
+        "type": "Paper",
+        "why": "Derive forward tensor partitioning from a foundational model-parallel design.",
+        "required": true
+      },
+      {
+        "title": "GPU MODE lecture 17 materials: collective communication",
+        "url": "https://github.com/gpu-mode/lectures",
+        "type": "Repository",
+        "why": "Use the lecture 17 code alongside the collective semantics.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Parallelism Strategies (L4)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture4.pdf",
+        "type": "Course",
+        "why": "Trace collective payloads and topology choices. Separate training-state assumptions from serving-state requirements.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — lecture playlist (access restricted)",
+        "url": "https://www.youtube.com/playlist?list=PLnocShPlK-FtamE4EYyDvPCKGT0DAJOwN",
+        "type": "Video",
+        "why": "Optional if you have access: the course site states a Berkeley email is required. Use the public slides or GPU MODE recordings otherwise.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Price the communication before distributing",
+      "path": "labs/06_moe.py",
+      "command": "python3 labs/06_moe.py",
+      "task": "Run the supplied CPU simulation of expert/rank token counts and hot-expert replication; inspect its weighted dispatch/combine reference. It does not execute collectives. Learner work: add a communication cost model, then implement a distributed linear layer and an NCCL message-size sweep on 2+ compatible GPUs.",
+      "success": "Tensor layouts match a single-device reference, measured collectives are distinguished from simulated costs, and the scaling report includes an equal-hardware replication baseline."
+    },
+    "completion": [
+      "Explain all-gather versus all-reduce from matrix shapes.",
+      "Fit and critique a collective latency model on actual hardware when available.",
+      "Produce a workload-dependent placement recommendation rather than a universal GPU-count rule."
+    ]
+  }
+]

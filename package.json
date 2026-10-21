@@ -1,0 +1,30 @@
+{
+  "name": "inference-atelier",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/validate-content.mjs && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "test": "node scripts/validate-content.mjs && node --test tests/*.test.js"
+  },
+  "license": "MIT",
+  "description": "An open research-level course in inference systems",
+  "dependencies": {
+    "@fontsource-variable/dm-sans": "5.3.0",
+    "@fontsource-variable/newsreader": "5.3.0",
+    "dompurify": "3.4.17",
+    "katex": "0.18.2",
+    "lucide-react": "1.61.0",
+    "marked": "18.1.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "vite": "7.3.7"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  }
+}

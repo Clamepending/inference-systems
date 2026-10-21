@@ -1,0 +1,1645 @@
+[
+  {
+    "id": "13",
+    "slug": "moe-dispatch-and-imbalance",
+    "title": "The slowest expert sets the pace",
+    "subtitle": "Implement dispatch and combine, then make skew your adversary.",
+    "phase": 4,
+    "week": 13,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "2+ GPUs",
+    "tags": [
+      "MoE",
+      "Expert parallelism",
+      "Collectives"
+    ],
+    "outcomes": [
+      "Implement top-k dispatch and weighted combine without changing model semantics.",
+      "Predict when communication or expert imbalance controls latency.",
+      "Evaluate replication with migration cost and changing workloads."
+    ],
+    "body": "A mixture-of-experts layer exchanges dense, predictable work for sparse, irregular work. A router chooses a small subset of experts for each token, but the machine must still store those experts, move activations to their owners, execute differently sized matrix multiplications, and restore the original token order. Counting only activated parameters misses most of the systems problem. [Mixtral](https://arxiv.org/abs/2401.04088) is a useful concrete routing architecture; [DeepEP](https://github.com/deepseek-ai/DeepEP) provides a communication implementation to study after building your own reference.\n\n## Preserve the logical expert computation\n\nFor token vector $x_t$, let $S_t$ contain the selected logical experts and $g_{t,e}$ their normalized weights. The layer computes\n\n$$y_t=\\sum_{e\\in S_t}g_{t,e}f_e(x_t).$$\n\nA logical expert is part of the model. A physical expert is a particular copy placed on a device. Replicating a logical expert can preserve this expression; replacing it with a different, less busy expert generally cannot. This distinction determines which load balancing interventions are numerical optimizations and which require model-quality evaluation.\n\n## Dispatch is a gather; combine is a reduction\n\nBuild the execution path in five explicit stages. Compute routing indices and weights. Count assignments per destination. Pack token vectors with their original token index and expert slot. Execute each expert on its gathered rows. Return and reduce the weighted outputs by original token index. A token routed to two experts creates two assignments, so a permutation alone is insufficient: the inverse operation includes a reduction. Use a simple reference first:\n\n```python\nout = zeros_like(tokens)\nfor token_id, expert_id, weight in assignments:\n    out[token_id] += weight * experts[expert_id](tokens[token_id])\n```\n\nYour optimized implementation must agree with this reference under a stated floating-point tolerance. Test repeated experts across tokens, empty expert batches, noncontiguous token IDs, and tokens whose selected experts live on different devices. Do not silently drop assignments when an expert exceeds a convenient buffer size. Capacity clipping changes outputs unless that behavior is explicitly part of the model contract.\n\n## Put a byte budget on communication\n\nNow derive a traffic estimate. With $N$ tokens, top-$k$ routing, hidden width $d$, and $b$ bytes per activation element, naive dispatch plus return moves approximately $2Nkd b$ bytes globally, before metadata and protocol overhead. Some assignments stay local; implementations can avoid redundant sends when several selected experts share a destination. Thus this is a logical traffic model, not a claim about NIC counters. For $N=4096$, $k=2$, $d=4096$, and BF16 activations, the model gives $134{,}217{,}728$ bytes, or 128 MiB. At an assumed aggregate effective payload rate of 100 GB/s, moving that amount alone takes about 1.34 ms. Using a single link's bandwidth as the denominator for whole-cluster traffic would be an invalid comparison.\n\n## Measure the slowest rank\n\nThe compute bottleneck is equally easy to hide. Suppose four ranks receive 4096, 2048, 1024, and 1024 assignments. The average is 2048, but the slowest rank receives twice that. Define imbalance $I=\\max_r n_r/\\operatorname{mean}_r n_r$. Here $I=2$. If execution cost is approximately linear in assignment count and all other costs vanish, perfect balancing can provide at most a twofold improvement for this stage. Real GEMM efficiency depends on shape, so doubling rows need not exactly double time. Record both assignment counts and measured rank completion times.\n\n## Make replication repay its cost\n\nReplication spends memory to reduce the maximum load. If the hottest expert receives 3000 assignments and has two copies, ideal splitting produces 1500 per copy. That arithmetic assumes equal device speed, uncongested routing, and enough free capacity elsewhere. A copy placed beside another hot expert may leave rank-level skew unchanged. A sensible placement objective therefore minimizes predicted maximum rank service time, subject to memory and migration constraints, rather than merely equalizing expert counts.\n\nRebalancing also has a break-even horizon. If moving weights costs 40 ms and saves 0.2 ms per subsequent step, the new placement needs more than 200 useful steps to repay migration. When workload phases change every 50 steps, an aggressive controller may perpetually chase yesterday's hot expert. Add hysteresis, a minimum residency period, and a migration budget. Keep an oracle placement as an upper bound; it is not a deployable baseline because it knows future traffic.\n\n## Test the critical path under changing traffic\n\nThe supplied MoE lab is a CPU teaching simulation of routing load. Extend it into a real dispatch/combine implementation only when you have the devices and communication library. For the simulation, sweep uniform, skewed, and phase-changing assignments using fixed seeds. Report imbalance before and after placement, predicted critical-path work, and migration volume. For the accelerator extension, measure dispatch, expert GEMM, combine, and exposed communication separately, then measure the entire layer without diagnostic synchronization. Report p50 and p99 step latency, per-rank loads, memory, and all assignment losses, which should be zero.\n\nA trace can show concurrent communication and compute without proving successful overlap. The overlap helps only if it shortens the layer's critical path; it can also steal memory bandwidth or execution resources from the GEMMs. Compare serial and overlapped variants at identical routes and batch shapes. Finish the week with one case where replication wins and one where it loses. The general lesson is to treat sparse model structure as a changing scheduling problem constrained by exact token semantics, not as an automatic reduction in serving cost.",
+    "exercises": [
+      {
+        "title": "Reconstruct the inverse dispatch",
+        "prompt": "Three tokens select experts (0,1), (1,2), (0,2) with weights (0.7,0.3), (0.4,0.6), (0.2,0.8). Design metadata sufficient to combine any arrival order.",
+        "hint": "The receiver needs original token identity and routing slot; network order is not an identity.",
+        "solution": "Carry (request/sequence ID, token position, routing slot, logical expert ID, weight). Accumulate each returned vector into its original token exactly once. Expected outputs are 0.7 f0(x0)+0.3 f1(x0), 0.4 f1(x1)+0.6 f2(x1), and 0.2 f0(x2)+0.8 f2(x2). Check six completed assignments and one final vector per token."
+      },
+      {
+        "title": "Price a replica",
+        "prompt": "An expert migration costs 75 ms. It reduces each layer step from 2.8 ms to 2.3 ms for 120 steps before a traffic phase changes. Is it worthwhile?",
+        "hint": "Compare accumulated savings with the one-time cost.",
+        "solution": "Savings are 120 × 0.5 = 60 ms, below the 75 ms migration cost. Net latency increases 15 ms. Break-even is 150 steps; a strict improvement requires more than 150, ignoring added memory and routing overhead."
+      },
+      {
+        "title": "Separate model routing from physical placement",
+        "prompt": "Propose an experiment comparing hot-expert replication with routing to a less busy different expert.",
+        "hint": "One changes execution placement; the other changes the function.",
+        "solution": "Hold tokens, logical router decisions, and weights fixed for the replication experiment; compare outputs to the unreplicated reference and latency under the same trace. The alternative-expert experiment must separately measure model quality because f_a(x) generally differs from f_b(x). Do not mix its throughput into an exact-optimization claim."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Four ranks receive [100,100,100,500] assignments. What is the imbalance ratio?",
+        "options": [
+          "1.25",
+          "2.0",
+          "2.5",
+          "5.0"
+        ],
+        "answer": 2,
+        "explanation": "The mean load is (100+100+100+500)/4 = 200 assignments. Dividing the maximum, 500, by that mean gives 2.5; dividing by the smallest rank would measure something different."
+      },
+      {
+        "question": "Which intervention preserves the logical MoE function in principle?",
+        "options": [
+          "Run the chosen expert on an identical physical replica",
+          "Replace the busiest expert with the next-best router score",
+          "Drop assignments beyond capacity",
+          "Normalize weights after deleting one route"
+        ],
+        "answer": 0,
+        "explanation": "An identical physical replica evaluates the same logical expert function, provided routing weights and combine semantics are preserved. Substituting another expert or dropping a route changes the model computation."
+      },
+      {
+        "question": "Why can expert counts look balanced while ranks are imbalanced?",
+        "options": [
+          "Router probabilities are always uniform",
+          "Counts omit all tokens",
+          "The tokenizer is stochastic",
+          "Several busy experts may share one rank"
+        ],
+        "answer": 3,
+        "explanation": "Ranks execute the sum of work assigned to their resident experts. Several individually busy experts can share one rank, so balancing expert totals alone does not balance the device critical path."
+      },
+      {
+        "question": "A 30 ms migration saves 0.1 ms per step. When is latency improved?",
+        "options": [
+          "After 30 steps",
+          "After more than 300 useful steps",
+          "Immediately",
+          "After 3 steps"
+        ],
+        "answer": 1,
+        "explanation": "The accumulated saving is 0.1 ms times the number of useful steps. At 300 steps it only repays the 30 ms move; a strict improvement requires more than 300 steps and assumes no additional overhead."
+      },
+      {
+        "question": "Which result best demonstrates useful communication overlap?",
+        "options": [
+          "Two colored bars overlap in a trace",
+          "Communication bandwidth rises",
+          "End-to-end layer time falls at identical routing and correctness",
+          "GEMM count rises"
+        ],
+        "answer": 2,
+        "explanation": "Useful overlap reduces the time until the entire layer finishes under the same routes, shapes, and correctness contract. Concurrent trace bars alone do not prove a shorter critical path and may hide resource contention."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Mixtral of Experts",
+        "url": "https://arxiv.org/abs/2401.04088",
+        "type": "Paper",
+        "why": "Read the routing definition and distinguish total from activated parameters.",
+        "required": true
+      },
+      {
+        "title": "DeepEP",
+        "url": "https://github.com/deepseek-ai/DeepEP",
+        "type": "Repository",
+        "why": "Inspect dispatch/combine APIs and the separate workload regimes.",
+        "required": true
+      },
+      {
+        "title": "Berkeley Scalable AI — Parallelism Strategies (L4)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture4.pdf",
+        "type": "Course",
+        "why": "Trace collective payloads and topology choices. Separate training-state assumptions from serving-state requirements.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Adversarial expert traffic",
+      "path": "labs/06_moe.py",
+      "command": "python3 labs/06_moe.py",
+      "task": "Run the CPU routing simulation; extend it with phase-changing traffic and migration cost. Optional: implement real multi-device dispatch/combine.",
+      "success": "Preserve every assignment, show maximum rank load, and report a replication break-even horizon."
+    },
+    "completion": [
+      "Correct dispatch/combine against a reference.",
+      "Uniform and changing-skew experiments with a losing case.",
+      "A report separating simulated work from measured GPU time."
+    ]
+  },
+  {
+    "id": "14",
+    "slug": "disaggregated-serving",
+    "title": "When prefill and decode should separate",
+    "subtitle": "A transfer budget, two queues, and a fair comparison.",
+    "phase": 4,
+    "week": 14,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "2+ GPUs",
+    "tags": [
+      "Disaggregation",
+      "KV transfer",
+      "Goodput"
+    ],
+    "outcomes": [
+      "Derive a KV transfer lower bound from the actual cache representation.",
+      "Compare colocated and separated service under equal resources.",
+      "Design handoff ownership and failure recovery."
+    ],
+    "body": "Prefill and decode ask different things of a GPU. A long prompt supplies many token rows at once; a decode iteration supplies a small number of new rows while reading historical state. Sharing devices lets an engine exploit spare capacity, but one phase can disrupt the other's deadlines. Separating the phases gives independent scheduling and placement at the cost of moving state and managing another queue. [DistServe](https://arxiv.org/abs/2401.09670) frames this as a goodput problem under both first-token and inter-token constraints. Treat its architecture as a hypothesis whose advantage depends on workload and interconnect.\n\n## Draw the handoff timeline\n\nStart with a complete timeline. A request arrives, waits for prefill, executes prefill, transfers its cache, waits for decode admission, and produces output. For a first token emitted by the decode side, an illustrative decomposition is\n\n$$T_{\\mathrm{first}}=Q_P+P+X_{KV}+Q_D+D_1.$$\n\nAn engine may emit the first token on the prefill worker, so instrument the actual boundary rather than imposing this formula blindly. A user can receive token one promptly and then wait a long time for token two while handoff occurs. Report the largest early token gap as well as time to first token. Otherwise an implementation can appear responsive while moving its delay just beyond the chosen metric.\n\n## Derive the actual KV payload\n\nThe transfer size comes from the cache representation, not the parameter count. For ordinary grouped-query attention with $L$ layers, $h_{kv}$ key/value heads, head width $d_h$, $s$ cached positions, and $b$ bytes per scalar,\n\n$$M_{KV}=2Lh_{kv}d_hsb.$$\n\nThe factor two represents keys and values. With 32 layers, eight KV heads, width 128, 8192 positions, and BF16 storage, the cache occupies 1,073,741,824 bytes: exactly 1 GiB before padding and metadata. A 25 GB/s effective link needs at least 42.95 ms for that payload; a 100 GB/s link needs 10.74 ms. Both are optimistic bounds. Include serialization, connection setup, memory registration, source/destination copies, and any layout conversion actually present.\n\nCompression changes this calculation. A latent cache may store substantially fewer elements; quantized state may add scale metadata; sliding-window layers retain only a suffix. Tensor and context parallel layouts can require redistribution. Write a cache inventory per layer type before estimating network load. Never use dense-attention cache bytes to claim a transfer bottleneck for a model with a compressed representation. Conversely, allocating a compressed cache does not establish that your transfer implementation sends the compressed form.\n\n## Find the latency crossover\n\nDisaggregation is worthwhile when avoided interference and better resource specialization exceed transfer and coordination costs at the desired operating point. Consider a deliberately simplified example: colocation produces 75 ms p95 inter-token gaps during long prompts. Separation reduces these to 30 ms, but adds 25 ms to a 300 ms first-token target. If prefill plus queues previously consumed 250 ms, that request still fits the target at 275 ms. If it consumed 290 ms, the same change fails first-token service. One global throughput number cannot represent both cases.\n\n## Balance two service pools\n\nResource allocation is a tandem-queue problem. Suppose a prefill worker can sustainably admit 4 requests/s for the chosen prompt mix, while a decode worker can complete 2 requests/s for the chosen output mix. One prefill worker feeding one decode worker does not form a 4 requests/s system: decode is the bottleneck. A 1:2 worker ratio nominally balances rates, but variance and SLO headroom still matter. Those rates are workload dependent, especially with prefix hits and heavy-tailed outputs. Measure service demand distributions rather than assuming every request consumes equal work.\n\n## Transfer ownership, not just bytes\n\nState transfer needs a protocol. Assign a request generation ID and a cache version; reserve destination capacity before committing ownership; acknowledge complete receipt; only then permit source reclamation. Partial transfer must not expose a half-populated cache to decode. Cancellation must reach both workers. If a worker dies after sending tokens, a retry must not append an unrelated second continuation to the same stream. A robust implementation distinguishes replayable prefill work, committed output, and uncommitted speculative state.\n\n## Run an equal-resource experiment\n\nThe reference scheduler lab models admission and queueing on the CPU. This week you extend its event model with separate prefill/decode servers and an explicit transfer delay; the supplied script does not claim to run a disaggregated GPU service. First verify zero-transfer cases against a hand-calculated timeline. Then sweep prompt length, output length, cache-hit fraction, link rate, and arrival burstiness. Keep total GPU count fixed across the comparison and include a tuned colocated baseline with chunked prefill. Comparing an untuned single device against several specialized workers confounds the architectural conclusion.\n\nA measurement subtlety matters here: percentiles do not generally add. Adding the p95 transfer time to the p95 prefill time is not necessarily the p95 total, because the slow cases may occur on different requests or be correlated. Join stage records by request ID and compute end-to-end percentiles from the summed per-request timelines. Use component percentiles for diagnosis, not as an unjustified service-level guarantee.\n\nFor hardware work, log every handoff with request ID, bytes, source/destination, start/end timestamps, and cache ownership transitions. Measure per-stage queues, GPU utilization, network payload, first-token latency, token gaps, completion latency, and SLO-qualified goodput. Include failed and rejected requests in the denominator. Add a transfer interruption test and verify eventual reclamation. The experiment succeeds when it maps a crossover region: where separation helps, where colocation wins, and which measured term explains that boundary.",
+    "exercises": [
+      {
+        "title": "Compute the transfer floor",
+        "prompt": "A cache has 40 layers, 8 KV heads, head width 128, 4096 positions, and 2-byte elements. Compute payload and a lower bound at 50 GB/s.",
+        "hint": "Use decimal bandwidth and keep bytes until the final division.",
+        "solution": "2×40×8×128×4096×2 = 671,088,640 bytes = 640 MiB. Divide by 50×10^9 bytes/s to obtain 0.0134218 s, or 13.42 ms. This excludes overhead and contention."
+      },
+      {
+        "title": "Find the bottleneck ratio",
+        "prompt": "Prefill capacity is 6 requests/s/worker; decode capacity is 1.5 requests/s/worker. With ten identical-cost workers, choose an integer allocation maximizing ideal steady-state throughput.",
+        "hint": "Compare min(6P,1.5D) subject to P+D=10.",
+        "solution": "P=2,D=8 gives min(12,12)=12 requests/s. P=1 gives 6; P=3 gives 10.5. The balanced allocation is optimal under these simplified constant-rate assumptions; real latency SLOs require spare capacity."
+      },
+      {
+        "title": "Close the handoff race",
+        "prompt": "The source frees KV immediately after starting an asynchronous transfer. Identify the bug and design a cancellation-safe protocol.",
+        "hint": "Sending a transfer is not the same as the destination owning valid state.",
+        "solution": "Keep source references until destination acknowledges a complete versioned cache. Reserve target memory first. On cancellation, mark the generation cancelled, stop decode admission, then release each side only after transfer completion or abort is confirmed. Use idempotent release and generation IDs to reject stale acknowledgements."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "What must be held fixed for a fair architecture comparison?",
+        "options": [
+          "Only model name",
+          "Total resources, workload, quality, and SLO definition",
+          "Only peak tokens/s",
+          "Only prompt count"
+        ],
+        "answer": 1,
+        "explanation": "Keep hardware resources, offered requests, quality requirements, and SLO definitions matched. Otherwise an apparent architectural gain may come from extra devices, easier requests, or weaker service requirements."
+      },
+      {
+        "question": "A prefill worker serves 5 req/s and a decode worker 2 req/s. One of each sustains at most:",
+        "options": [
+          "7 req/s",
+          "5 req/s",
+          "3.5 req/s",
+          "2 req/s"
+        ],
+        "answer": 3,
+        "explanation": "Each admitted request must pass through both stages. The decode worker can finish only two requests per second, so a faster prefill worker merely creates a growing downstream queue above that rate."
+      },
+      {
+        "question": "Which event permits freeing source KV?",
+        "options": [
+          "Destination acknowledges the complete valid cache under the handoff protocol",
+          "Transfer was enqueued",
+          "First network packet was sent",
+          "A timeout was configured"
+        ],
+        "answer": 0,
+        "explanation": "The source must retain valid state until the destination has acknowledged complete receipt under the ownership protocol. Enqueueing a transfer proves neither completion nor that cancellation was handled."
+      },
+      {
+        "question": "Why can TTFT conceal a handoff regression?",
+        "options": [
+          "TTFT includes every generated token",
+          "KV transfer is always free",
+          "Token one may be emitted before a long pause during transfer",
+          "Decode never waits"
+        ],
+        "answer": 2,
+        "explanation": "An implementation may emit token one on the prefill worker before moving KV. TTFT can therefore remain low while token two arrives after a long transfer pause; inspect the early inter-token gap as well."
+      },
+      {
+        "question": "Which quantity is the correct basis for KV transfer bytes?",
+        "options": [
+          "Total model parameters",
+          "Actual stored per-layer cache representation",
+          "Peak GPU FLOPs",
+          "Vocabulary size alone"
+        ],
+        "answer": 1,
+        "explanation": "Transfer size follows the tensors actually stored and sent, including head counts, latent compression, windows, precision, padding, and metadata. Total parameter count describes weights, which are a different object."
+      }
+    ],
+    "resources": [
+      {
+        "title": "DistServe",
+        "url": "https://arxiv.org/abs/2401.09670",
+        "type": "Paper",
+        "why": "Read the joint TTFT/TPOT objective and placement assumptions.",
+        "required": true
+      },
+      {
+        "title": "DistServe presentation at OSDI 2024",
+        "url": "https://www.usenix.org/conference/osdi24/presentation/zhong-yinmin",
+        "type": "Video",
+        "why": "Watch the author presentation, then reproduce one figure with your own workload.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Two queues and a transfer",
+      "path": "labs/03_scheduler.py",
+      "command": "python3 labs/03_scheduler.py",
+      "task": "Extend the CPU scheduler simulator with prefill and decode service pools plus a configurable KV transfer event.",
+      "success": "Plot a fixed-resource crossover and verify handoff/cancellation invariants in the extension."
+    },
+    "completion": [
+      "Byte-exact cache transfer model.",
+      "Equal-resource comparison against tuned colocation.",
+      "Documented ownership and failure protocol."
+    ]
+  },
+  {
+    "id": "15",
+    "slug": "routing-overload-and-cost",
+    "title": "Build a service that survives success",
+    "subtitle": "Route by work, reject overload early, and price useful output.",
+    "phase": 4,
+    "week": 15,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "Routing",
+      "Reliability",
+      "Cost"
+    ],
+    "outcomes": [
+      "Design admission control using predicted work and memory.",
+      "Prevent retry amplification and reclaim cancelled state.",
+      "Compare cost per successful SLO-qualified request."
+    ],
+    "body": "A serving system that performs well only below saturation is unfinished. Inference requests vary enormously in prompt size, output length, cache reuse, and modality cost. Ten short cached requests may be cheaper than one uncached document. Routing by queue length alone ignores that difference. [Google's overload chapter](https://sre.google/sre-book/handling-overload/) explains why query rate is often a poor resource proxy; translate that insight into token work, cache occupancy, and deadlines for your engine.\n\n## Route by work and cache benefit\n\nConstruct a predicted completion cost for each candidate replica. A simple score is queued service time plus estimated new service time, with penalties for insufficient KV headroom and a benefit for reusable prefixes. This is a policy model, not a physical law. Fit service estimates from observed prompt/output buckets, track residuals, and use conservative quantiles near deadlines. A cache-aware router can reduce repeated prefill while concentrating traffic on a hot replica, so cache affinity must compete against queue delay.\n\nConsider two replicas. A has 20 ms of queued work and can prefill a request in 10 ms because its prefix is cached. B has no queue but needs 50 ms for full prefill. A is the better first-token choice at a predicted 30 ms. If A's queue grows to 80 ms, B becomes preferable. The crossover is explicit: send to A only while its additional queueing stays below the 40 ms cache benefit, assuming decode capacity and memory are otherwise comparable. Measure the hit benefit; a nominal prefix hit may still require layout work or cache transfer.\n\n## Understand the cost of lost headroom\n\nQueueing explodes near capacity. In an illustrative M/M/1 model with arrival rate $\\lambda$ and service rate $\\mu$, mean response time is\n\n$$E[T]=\\frac{1}{\\mu-\\lambda}.$$\n\nAt $\\mu=100$ requests/s and $\\lambda=80$, the mean is 50 ms; at $\\lambda=95$, it is 200 ms. This model assumes Poisson arrivals and exponential service on one server, so it does not predict real continuous-batching latency directly. Its useful lesson is the sensitivity to headroom. For real inference, replay measured arrivals and service demands, including bursts and long outputs, instead of fitting a single average and declaring the queue solved.\n\n## Admit work before spending resources\n\nAdmission control should happen before expensive irreversible work. Check queue budget, predicted deadline feasibility, and cache reservation. If admission is impossible, reject quickly with a retry policy that does not amplify load. Once admitted, enforce output limits and cancellation promptly. A cancelled stream that continues generating invisibly wastes compute and may hold the exact KV pages needed by successful requests. Track reclaimed bytes and time from cancellation to reclamation; closing an HTTP connection is not proof that device work stopped.\n\n## Break the retry feedback loop\n\nRetries create positive feedback. Suppose original traffic is 80 requests/s and each failed attempt retries independently with probability $r=0.25$. With no limit, the expected attempts per request are $1/(1-r)=1.333$, producing about 106.7 attempts/s. A 100 attempts/s system can therefore be overloaded by a demand level that originally fit. [The cascading-failures chapter](https://sre.google/sre-book/addressing-cascading-failures/) motivates bounded retries, backoff, jitter, and explicit retry budgets. Inference additionally needs stream-aware recovery: replaying a request after partial output can duplicate tokens or branch its continuation.\n\nDesign failure recovery around committed state. Give every logical request an idempotency key and every execution attempt a generation ID. Track which tokens have been delivered, which KV version corresponds to them, and whether exact continuation is supported. If exact state recovery is unavailable, return an explicit failure or a clearly new attempt; do not silently stitch two incompatible generations together. Simulate worker death before prefill, during handoff, and after several output tokens. Verify that orphaned reservations eventually disappear.\n\n## Price useful completions\n\nCost should count useful work. Define $G$ as completed requests meeting both latency and quality requirements during a wall-clock interval, and $C$ as all infrastructure cost during that same interval. Then cost per good request is $C/G$. If deployment A costs an illustrative $12/hour and delivers 600 good requests/hour, its cost is $0.02 each. B costs $18/hour and delivers 1200, so its cost is $0.015 each. These are invented accounting examples, not current cloud prices. Include idle replicas, failed attempts, CPU, networking, and storage when they are material.\n\nDo not let a high rejection rate manufacture an attractive tail latency. Report offered load, accepted load, completion rate, timeout rate, rejection rate, and goodput together. A service that accepts one easy request and rejects the rest can have excellent p99 latency with terrible utility. Define eligibility and SLOs before running the benchmark, stratify by workload class, and preserve the same offered trace for all policies.\n\n## Stress the service until it recovers\n\nThis week's CPU scheduler extension adds bounded queues, work-based routing, cache-affinity scores, cancellation, and retry budgets. Compare round-robin, shortest queue, and predicted least work. Inject a fivefold arrival burst and remove one replica halfway through a run. Report recovery time and whether queue length returns to baseline. The underlying fix for overload is a controlled admission boundary backed by honest work accounting. Autoscaling can add capacity later, but it cannot rescue already accumulated stale work instantaneously.",
+    "exercises": [
+      {
+        "title": "Choose a cache-aware destination",
+        "prompt": "Replica A has 65 ms queued work and a 15 ms cached prefill. Replica B has 10 ms queued and a 60 ms full prefill. Which wins, ignoring decode differences?",
+        "hint": "Add queue and service cost.",
+        "solution": "A predicts 80 ms; B predicts 70 ms, so B wins despite missing the prefix. Cache affinity is worthwhile only if saved service exceeds extra waiting."
+      },
+      {
+        "title": "Bound retry amplification",
+        "prompt": "Original demand is 120 requests/s. Each attempt retries with probability 0.2, with at most two retries. Compute expected attempts/s.",
+        "hint": "Use the finite geometric sum 1+r+r².",
+        "solution": "Expected attempts per original request are 1+0.2+0.04=1.24. Attempt load is 148.8/s. A server able to execute 140/s will still overload; backoff changes timing but does not erase this expected work."
+      },
+      {
+        "title": "Audit a misleading cost claim",
+        "prompt": "A costs $24/hour and produces 2400 responses, 60% satisfying SLOs. B costs $30/hour and produces 2100, 95% satisfying SLOs. Compare cost per good response.",
+        "hint": "Use the successful counts rather than raw output.",
+        "solution": "A has 1440 good responses and costs $0.01667 each. B has 1995 good responses and costs $0.01504 each. B is cheaper per useful result despite greater hourly cost and fewer total responses. Keep quality thresholds and request mix identical."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Which routing signal is most useful for heterogeneous prompts?",
+        "options": [
+          "Request count alone",
+          "Predicted queued service demand with memory and cache context",
+          "Alphabetical request ID",
+          "GPU purchase price"
+        ],
+        "answer": 1,
+        "explanation": "Queued service demand estimates how long the new request will wait and execute. Memory availability and cache reuse can change that estimate substantially, even when replicas have the same number of requests."
+      },
+      {
+        "question": "Why should rejected requests appear in the report?",
+        "options": [
+          "They improve the p99 estimator",
+          "They use no network",
+          "They are always user mistakes",
+          "Otherwise dropping hard work can masquerade as better service"
+        ],
+        "answer": 3,
+        "explanation": "Without offered-load outcomes, a service can improve its latency chart simply by rejecting difficult requests. Reporting rejections together with qualifying completions reveals whether users actually receive more useful service."
+      },
+      {
+        "question": "What is the unbounded expected retry multiplier at r=0.1?",
+        "options": [
+          "1/0.9, about 1.111",
+          "0.9",
+          "1.01",
+          "10"
+        ],
+        "answer": 0,
+        "explanation": "With independent retry probability r, expected attempts are the geometric sum 1+r+r²+… = 1/(1−r). At r=0.1 this is about 1.111 attempts per original request; a finite retry cap changes the sum."
+      },
+      {
+        "question": "What demonstrates cancellation completed?",
+        "options": [
+          "The browser stopped displaying tokens",
+          "An HTTP socket closed",
+          "Compute/state ownership is terminated and reservations are reclaimed",
+          "The retry counter reset"
+        ],
+        "answer": 2,
+        "explanation": "A closed connection does not guarantee that scheduled device work or KV reservations have stopped. Completion of cancellation requires the execution and ownership protocol to terminate work and reclaim its resources."
+      },
+      {
+        "question": "Which cost denominator matches a user-facing serving objective?",
+        "options": [
+          "Peak tokens in one batch",
+          "SLO- and quality-qualified completions over the billed interval",
+          "Parameters loaded",
+          "Requests initially accepted"
+        ],
+        "answer": 1,
+        "explanation": "Cost per good request divides all relevant interval cost by completions satisfying the declared latency and quality contract. Raw tokens or accepted requests can include failures, wasted work, and unusable output."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Handling Overload",
+        "url": "https://sre.google/sre-book/handling-overload/",
+        "type": "Documentation",
+        "why": "Translate work-based load and admission concepts to tokens and KV pages.",
+        "required": true
+      },
+      {
+        "title": "Addressing Cascading Failures",
+        "url": "https://sre.google/sre-book/addressing-cascading-failures/",
+        "type": "Documentation",
+        "why": "Study retry feedback and recovery under reduced capacity.",
+        "required": true
+      }
+    ],
+    "lab": {
+      "title": "Overload, cancellation, recovery",
+      "path": "labs/03_scheduler.py",
+      "command": "python3 labs/03_scheduler.py",
+      "task": "Extend the CPU event simulator with replicas, bounded admission, retries, and a worker-failure event.",
+      "success": "Report offered/accepted/good requests, recovery time, and no leaked reservations."
+    },
+    "completion": [
+      "Route a trace with unequal request sizes.",
+      "Recover from burst and replica failure without an unbounded queue.",
+      "Compute cost per good request with failed work included."
+    ]
+  },
+  {
+    "id": "16",
+    "slug": "exact-speculative-decoding",
+    "title": "Guess ahead without changing the distribution",
+    "subtitle": "Acceptance is probability mass accounting, not a confidence threshold.",
+    "phase": 5,
+    "week": 16,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "Speculation",
+      "Sampling",
+      "Correctness"
+    ],
+    "outcomes": [
+      "Derive the acceptance and residual distributions.",
+      "Predict when drafting repays its extra computation.",
+      "Test sampling correctness separately from speed and same-seed identity."
+    ],
+    "body": "Imagine paying to fetch a large book from a distant shelf every time you read one word. Once the book is open, checking several proposed words can be relatively cheap. Speculative decoding exploits a similar asymmetry: an inexpensive draft proposes several tokens, and the target scores those positions together. The hard part is not guessing well. It is recovering the target distribution when the guess is wrong. The original papers by [Leviathan and colleagues](https://arxiv.org/abs/2211.17192) and [Chen and colleagues](https://arxiv.org/abs/2302.01318) establish exact distribution-preserving sampling schemes under their numerical assumptions.\n\n## Acceptance keeps the overlapping probability mass\n\nLet $p(x)$ be the target's next-token distribution and $q(x)$ the draft's distribution at the same prefix. Draw $x\\sim q$ and accept it with probability\n\n$$a(x)=\\min\\left(1,\\frac{p(x)}{q(x)}\\right).$$\n\nOnly draft-supported tokens are proposed, so division by zero is not needed for a sampled token in exact arithmetic. Accepted mass for token $x$ is $q(x)a(x)=\\min(p(x),q(x))$. This is the overlap between two probability histograms. Rejected mass must be placed where the target has more probability than the draft. Therefore, after rejection, draw from\n\n$$r(x)=\\frac{\\max(p(x)-q(x),0)}{\\sum_z\\max(p(z)-q(z),0)}.$$\n\nThe denominator is the rejection probability. Multiplying the residual distribution by that probability restores exactly the missing target mass, so accepted plus corrected mass equals $p$. If the distributions match perfectly, rejection never occurs and the zero residual denominator is an unreachable branch, not permission to divide by zero.\n\n## Repair a three-token distribution by hand\n\nWork through three tokens. Let $p=(0.5,0.3,0.2)$ and $q=(0.2,0.5,0.3)$. Acceptance probabilities are $(1,0.6,2/3)$. The accepted mass is $(0.2,0.3,0.2)$, totaling 0.7. Rejection occurs with probability 0.3, and the residual is $(1,0,0)$. Final mass is therefore $(0.5,0.3,0.2)$. An intuitive but wrong correction samples directly from $p$ after rejection; that would produce $(0.35,0.39,0.26)$. Even a plausible-looking language sample can conceal this systematic bias.\n\n## Extend the argument to a draft block\n\nFor a draft block of length $\\gamma$, target verification evaluates the relevant conditional distributions in parallel with causal masking. Walk left to right, accepting until the first rejection. At that position, sample the residual token and discard the unused draft suffix. If every draft token is accepted, sample one additional token from the target distribution after the full draft. The bonus token matters for both correctness bookkeeping and the speed model. Cache entries for rejected positions must be rolled back before the next iteration.\n\nA compact teaching implementation looks like this:\n\n```python\nfor i, proposed in enumerate(draft_tokens):\n    if uniform() < min(1.0, p[i][proposed] / q[i][proposed]):\n        emit(proposed)\n    else:\n        residual = positive_part(p[i] - q[i])\n        emit(sample(normalize(residual)))\n        rollback_after(i)\n        break\nelse:\n    emit(sample(p_after_draft))\n```\n\nEvery distribution in this code must include the intended temperature, masking, and sampling transformations. Applying top-p to the target in one path and forgetting it in another defines different target processes. The target distribution is the one after the declared decoding rules, not necessarily the raw softmax. Grammar constraints, stop conditions, and tokenizer compatibility deserve explicit tests.\n\n## Calculate expected progress and speed\n\nFor intuition about speed, assume every conditional acceptance has the same independent rate $\\alpha$. The expected emitted tokens per verification round are\n\n$$E[K]=1+\\alpha+\\cdots+\\alpha^\\gamma=\\frac{1-\\alpha^{\\gamma+1}}{1-\\alpha}.$$\n\nThis is a toy model: real acceptance varies with context and position. At $\\alpha=0.8$ and $\\gamma=4$, $E[K]=3.3616$. If four draft steps cost 8 ms, verification costs 12 ms, and bookkeeping costs 1 ms, the round costs 21 ms, or about 6.25 ms per emitted token. Against a 10 ms target-only decode step, predicted speedup is 1.60. At $\\alpha=0.3$, expected output falls to 1.4251 and the same method takes 14.74 ms per token: a slowdown.\n\n## Know when good guesses still lose\n\nHigh batch occupancy changes the bargain. Target verification may already be compute constrained; extra draft positions increase FLOPs, and draft KV consumes memory that could otherwise hold more requests. Optimizing single-request latency can reduce service goodput. Sweep draft length, batch occupancy, prompt length, and workload type, and report accepted tokens per target call alongside wall time and memory. Separate draft cost, target verification, synchronization, and rollback.\n\nYou can connect acceptance to a familiar statistical distance. For one fixed prefix, total accepted mass is $\\sum_x\\min(p(x),q(x))=1-\\operatorname{TV}(p,q)$, where $\\operatorname{TV}(p,q)=\\tfrac12\\sum_x|p(x)-q(x)|$. This explains why draft accuracy measured as next-token top-1 agreement is an incomplete predictor: two drafts can choose the same argmax yet assign very different probability mass elsewhere. Construct such a pair in the lab and compare acceptance. Conversely, optimizing acceptance alone can select an expensive draft whose extra latency erases its statistical advantage. Treat distribution overlap and draft execution cost as separate axes before choosing a draft model or block length.\n\n## Test the sampling contract\n\nThe supplied CPU lab tests the probability mechanism; it does not benchmark an accelerator or reproduce any published speedup. Use a tiny vocabulary to compare empirical output frequencies with known $p$, then use a conditional two-step model to detect incorrect prefix handling. Add a deliberately wrong rejection branch and ensure your test catches it. Same random seed does not imply identical sampled text across algorithms because they consume randomness differently. Distributional equivalence, greedy-token equivalence, and bitwise repeatability are three different contracts. Finish by stating exactly which one your implementation satisfies and by demonstrating a workload where speculation should be disabled.",
+    "exercises": [
+      {
+        "title": "Repair the missing mass",
+        "prompt": "For p=(0.6,0.4) and q=(0.9,0.1), calculate accepted mass, rejection probability, and residual.",
+        "hint": "Compute min(p,q) elementwise first.",
+        "solution": "Acceptance probabilities are (2/3,1). Accepted mass is (0.6,0.1), total 0.7. Rejection mass is 0.3 and residual is (0,1). Combining accepted and residual mass yields exactly (0.6,0.4)."
+      },
+      {
+        "title": "Choose a draft budget",
+        "prompt": "Assume alpha=0.7, gamma=3, target-only latency 9 ms, draft cost 1 ms/token, verification 10 ms, and overhead 1 ms. Estimate speedup.",
+        "hint": "Include the bonus token in the geometric sum.",
+        "solution": "E[K]=1+0.7+0.49+0.343=2.533. Round cost=3+10+1=14 ms. Per-token cost=14/2.533=5.527 ms. Speedup=9/5.527≈1.628. Validate the independent-acceptance and constant-cost assumptions with measurements."
+      },
+      {
+        "title": "Design a correctness trap",
+        "prompt": "An implementation samples from target p after any rejection. Construct a tiny test that rejects this implementation.",
+        "hint": "Use distributions with different high-probability tokens.",
+        "solution": "Use p=(0.6,0.4), q=(0.9,0.1). Wrong output distribution is min(p,q)+0.3p=(0.78,0.22), far from p. Draw many independent samples, report confidence intervals, and verify frequency near 0.6 rather than 0.78 for token zero. Also check a conditional model so prefix-dependent mistakes cannot hide."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "After rejecting a proposal, which distribution restores exactness?",
+        "options": [
+          "The draft distribution",
+          "The target distribution directly",
+          "Normalized positive part of p−q",
+          "Uniform over the vocabulary"
+        ],
+        "answer": 2,
+        "explanation": "Accepted proposals already supply min(p,q) probability mass to each token. The residual must supply exactly the remaining positive part of p−q; sampling directly from p would add mass to tokens already fully represented."
+      },
+      {
+        "question": "What is E[K] for alpha=0.5 and gamma=2 under the toy model?",
+        "options": [
+          "1.75",
+          "1.0",
+          "2.5",
+          "3.0"
+        ],
+        "answer": 0,
+        "explanation": "The round emits at least one token, a second when the first proposal is accepted, and a third when both are accepted. Under the constant independent-rate model this gives 1+0.5+0.25 = 1.75."
+      },
+      {
+        "question": "Same seed gives different sampled text. What follows?",
+        "options": [
+          "Exact speculation is disproved",
+          "The tokenizer must be wrong",
+          "The target model changed",
+          "No distributional conclusion follows from this alone"
+        ],
+        "answer": 3,
+        "explanation": "A seed identifies a random stream, but two algorithms can consume that stream in different orders. Distributional correctness requires a proof and appropriate sampling tests, not identical text for one shared seed."
+      },
+      {
+        "question": "Which cache operation is necessary after the first rejection?",
+        "options": [
+          "Keep all proposed state as committed",
+          "Discard or invalidate the rejected suffix before continuation",
+          "Delete the whole request",
+          "Reuse the last draft logits"
+        ],
+        "answer": 1,
+        "explanation": "KV entries after the rejection were computed from a prefix that was never accepted. They must be discarded or invalidated before continuation; otherwise later target scores condition on the wrong history."
+      },
+      {
+        "question": "Why can higher acceptance still fail to improve serving goodput?",
+        "options": [
+          "Acceptance has no relation to speed",
+          "The target never runs",
+          "Draft/verification cost and memory can outweigh saved iterations",
+          "The bonus token is always incorrect"
+        ],
+        "answer": 2,
+        "explanation": "Acceptance measures statistical overlap, while goodput also depends on draft latency, verification work, synchronization, and memory consumed. A more accurate but expensive draft can lower useful service throughput."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Fast Inference from Transformers via Speculative Decoding",
+        "url": "https://arxiv.org/abs/2211.17192",
+        "type": "Paper",
+        "why": "Study the exact sampling algorithm and expected progress derivation.",
+        "required": true
+      },
+      {
+        "title": "Accelerating Large Language Model Decoding with Speculative Sampling",
+        "url": "https://arxiv.org/abs/2302.01318",
+        "type": "Paper",
+        "why": "Compare the independent formulation and implementation assumptions.",
+        "required": true
+      },
+      {
+        "title": "GPU MODE lecture 22 materials",
+        "url": "https://github.com/gpu-mode/lectures#lecture-22-hackers-guide-to-speculative-decoding-in-vllm",
+        "type": "Course",
+        "why": "Follow the implementation-oriented lecture and linked channel after deriving the sampler.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Deployment Preparation (L17)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture_17.pdf",
+        "type": "Course",
+        "why": "Cross-check speculative decoding and quantization deployment tradeoffs against your probability and numerical experiments.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Exact sampling, measured bias",
+      "path": "labs/07_speculation.py",
+      "command": "python3 labs/07_speculation.py",
+      "task": "Run the categorical CPU sampler, then add a conditional-prefix case and a deliberately biased rejection branch.",
+      "success": "Recover target frequencies, detect the wrong sampler, and calculate a losing speed regime."
+    },
+    "completion": [
+      "Derive acceptance and residual mass without notes.",
+      "Distributional tests and cache rollback invariant.",
+      "Speed model plus an evidence-based disable region."
+    ]
+  },
+  {
+    "id": "17",
+    "slug": "low-precision-and-quality",
+    "title": "Spend bits where they buy behavior",
+    "subtitle": "Quantization is a joint numerical, kernel, and evaluation problem.",
+    "phase": 5,
+    "week": 17,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "1 GPU",
+    "tags": [
+      "Quantization",
+      "FP8",
+      "Quality"
+    ],
+    "outcomes": [
+      "Derive quantization error and metadata overhead.",
+      "Distinguish representation savings from kernel speed.",
+      "Evaluate behavior on held-out workloads with uncertainty."
+    ],
+    "body": "A lower bit width is a smaller container, not an automatic faster program. The machine may need to unpack values, load scales, convert formats, and run a kernel whose tiling is poor for your shapes. Meanwhile a small perturbation in weights can move a near-tied logit across a decision boundary. The inference engineer must connect three questions: what information is discarded, how the hardware consumes the representation, and which user-visible behaviors change.\n\n## Locate the rounding and clipping error\n\nBegin with symmetric integer quantization. For positive scale $s$ and integer range $[-Q,Q]$, encode $w$ as $q=\\operatorname{clip}(\\operatorname{round}(w/s),-Q,Q)$ and reconstruct $\\hat w=sq$. Without clipping, nearest rounding gives $|w-\\hat w|\\le s/2$. With clipping, that bound no longer applies to outliers. For $Q=7$ and a group's maximum magnitude 1.4, choose $s=0.2$. Values 0.31 and −0.94 reconstruct as 0.4 and −1.0, with errors 0.09 and 0.06. An unanticipated value 2.0 clips to 1.4, producing error 0.6. Calibration range therefore matters.\n\n## Follow error through the activation vector\n\nThe relevant linear-layer error is not simply weight error. If $y=Wx$ and $\\hat W=W+\\Delta W$, then\n\n$$\\Delta y=\\Delta W x,\\qquad \\|\\Delta y\\|\\le\\|\\Delta W\\|\\|x\\|.$$\n\nThe norm bound is conservative, but it explains why activation distribution matters. An error aligned with a large input channel can dominate one aligned with a rarely active channel. [AWQ](https://arxiv.org/abs/2306.00978) uses activation information to protect important weight channels. [SmoothQuant](https://arxiv.org/abs/2211.10438) redistributes scaling difficulty between weights and activations through an equivalent transformation before quantization. Read these as concrete strategies, not guarantees for arbitrary models or domains.\n\nA useful identity makes the scaling idea tangible. Let $D$ be an invertible diagonal matrix. Then $Wx=(WD)(D^{-1}x)$. Before rounding, this changes no output. After rounding, different choices of $D$ redistribute error. Scaling a large activation down may require scaling a weight column up, so there is a tradeoff rather than free accuracy. Test transformations in full precision first: a transpose or channel-axis mistake can produce an apparently sophisticated quantizer that is simply wrong.\n\n## Count payload, scales, and format costs\n\nCount storage honestly. Four-bit values require half a byte per weight only when actually packed. If each group of 128 weights has one FP16 scale, metadata adds $2/128=0.015625$ bytes per weight. Total is 0.515625 bytes, excluding zero points, padding, and exceptions. A billion such weights take 515.625 MB rather than the 500 MB implied by the payload alone. Smaller groups can reduce numerical error while increasing metadata traffic and potentially reducing kernel efficiency.\n\nFloating-point formats have different tradeoffs. Exponent bits determine dynamic range, mantissa bits determine local precision, and scaling granularity changes effective coverage. Avoid treating FP8, INT8, and four-bit formats as interchangeable labels. Record exact format, rounding, accumulation type, scale dtype, scale grouping, saturation handling, and whether activations, weights, or KV are quantized. A weight-only kernel still moves full-precision activations; a compressed KV cache affects attention rather than all model operations.\n\n## Validate behavior on held-out tasks\n\nQuality evaluation has several layers. First compare reconstructed tensors and linear outputs using absolute/relative error, outlier percentiles, and nonfinite counts. Then compare logits on identical prefixes with KL divergence, top-token agreement, and margins. Finally evaluate task success on held-out prompts representing the deployment: code, mathematical reasoning, long-context retrieval, structured output, or vision as appropriate. Mean perplexity alone can hide rare but consequential regressions. Keep calibration and evaluation examples disjoint, and freeze acceptance criteria before tuning.\n\nConsider a task set with 1000 examples. The reference solves 820 and the quantized model solves 810. A one-point aggregate difference does not reveal whether the models disagree on the same cases, nor whether uncertainty excludes a practically meaningful loss. Save paired per-example outcomes. If the quantized version loses 25 reference successes but gains 15 failures, the net loss is ten; use a paired analysis or bootstrap over examples to quantify it. Independent repeated generations require a clearly defined sampling protocol. Do not tune on this held-out set after seeing the result.\n\n## Distinguish compression from accelerated execution\n\nPerformance evaluation must separate a storage demonstration from accelerated execution. The supplied CPU lab quantizes and reconstructs values to expose numerical effects; it does not implement a production low-bit GEMM. For the accelerator extension, compare against a strong full-precision baseline on identical shapes, warmup policy, batch sizes, and outputs. Measure latency, throughput, peak memory, actual kernel choice, and scale/dequantization overhead. If compressed weights are expanded back to BF16 before every multiplication, any bandwidth benefit may vanish.\n\nQuantized KV deserves a separate experiment from quantized weights. Its error is reused by future queries and may behave differently as context length grows. Sweep context length and attention patterns, including retrieval of an early fact after a long distractor span. Record scales and saturation per cache block. A short-prompt evaluation that passes does not establish long-context quality, and a weight-only accuracy report says nothing by itself about a compressed attention cache.\n\n## Choose a measured quality–cost frontier\n\nFinish with a Pareto frontier rather than a single winning bit width. Each point should specify accuracy uncertainty, SLO goodput, memory, and cost. Include an out-of-calibration stress set and one workload where a higher-precision configuration wins. The professional skill is choosing the least expensive representation that meets a measured quality contract, while being able to explain exactly where and why it fails.",
+    "exercises": [
+      {
+        "title": "Count the metadata",
+        "prompt": "A 4-bit scheme uses groups of 64 weights, each with a 2-byte scale and 2-byte zero-point. What are effective bits per weight?",
+        "hint": "Convert metadata bytes per group into bits per weight.",
+        "solution": "Payload is 4 bits/weight. Metadata is 4×8/64=0.5 bits/weight. Total is 4.5 bits/weight, or 0.5625 bytes, before padding and exceptional values."
+      },
+      {
+        "title": "Find the decision boundary",
+        "prompt": "Two reference logits are 4.01 and 4.00. Quantization shifts them by −0.02 and +0.01. Compute the new greedy decision and explain why small average error can miss it.",
+        "hint": "Compare the margin with the difference of perturbations.",
+        "solution": "New logits are 3.99 and 4.01, so the second token wins. Original margin was 0.01 but relative perturbation was −0.03. A small mean error says little about near-tied decisions; inspect margin-conditioned disagreement and downstream task behavior."
+      },
+      {
+        "title": "Separate calibration from evaluation",
+        "prompt": "You have 10000 prompts from deployment logs. Design a defensible calibration and test split for long-context and multilingual traffic.",
+        "hint": "Stratify before tuning, and keep related sessions together.",
+        "solution": "Reserve an untouched session-level test split stratified by language and length; create calibration and development partitions from the rest. Fit scales only on calibration data, choose settings on development, then evaluate once on test with per-slice and paired outcome uncertainty. Keep a distinct distribution-shift set and report it separately."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "What breaks the s/2 reconstruction-error bound?",
+        "options": [
+          "Using a positive scale",
+          "Clipping an out-of-range value",
+          "Nearest rounding",
+          "A group with one element"
+        ],
+        "answer": 1,
+        "explanation": "The s/2 bound is a nearest-rounding bound for values inside the representable range. Clipping an outlier to the largest representable value can create arbitrarily larger error relative to that rounding step."
+      },
+      {
+        "question": "Why is activation-aware evaluation useful?",
+        "options": [
+          "Weights never matter",
+          "It eliminates calibration",
+          "Weight error is multiplied by the actual input vector",
+          "It guarantees exact tokens"
+        ],
+        "answer": 2,
+        "explanation": "For a linear layer, output error is ΔW x. Errors on frequently large or consequential activation channels can matter much more than equally sized errors on inactive channels, so weight error alone is incomplete."
+      },
+      {
+        "question": "What proves an INT4 representation accelerates inference?",
+        "options": [
+          "The checkpoint is smaller",
+          "The tensor dtype says int4",
+          "A quantization paper reports a speedup",
+          "Measured end-to-end speed with the actual packed kernel"
+        ],
+        "answer": 3,
+        "explanation": "A smaller checkpoint does not establish faster execution. Measure the actual packed kernel and the full inference path, including scale loads, unpacking, dequantization, and any change in achievable batch size."
+      },
+      {
+        "question": "Which identity supports equivalent channel rescaling before quantization?",
+        "options": [
+          "Wx=(WD)(D⁻¹x)",
+          "Wx=(WD)(Dx)",
+          "Wx=W+x",
+          "Wx=D(W+x)"
+        ],
+        "answer": 0,
+        "explanation": "For an invertible diagonal D, the factors D and D⁻¹ cancel in exact arithmetic. The transform preserves the original linear function before quantization while changing how rounding error is distributed afterward."
+      },
+      {
+        "question": "What should be fixed before tuning a quantizer?",
+        "options": [
+          "The best test-set score",
+          "Quality thresholds and a held-out evaluation protocol",
+          "The final reported speedup",
+          "A favorable subset of requests"
+        ],
+        "answer": 1,
+        "explanation": "Choose the quality contract and hold out evaluation data before fitting or selecting the quantizer. Repeatedly tuning against the test set can make reported accuracy reflect selection bias instead of generalization."
+      }
+    ],
+    "resources": [
+      {
+        "title": "AWQ",
+        "url": "https://arxiv.org/abs/2306.00978",
+        "type": "Paper",
+        "why": "Study activation-aware channel scaling and weight-only execution.",
+        "required": true
+      },
+      {
+        "title": "SmoothQuant",
+        "url": "https://arxiv.org/abs/2211.10438",
+        "type": "Paper",
+        "why": "Derive the equivalent transform and examine calibration assumptions.",
+        "required": true
+      },
+      {
+        "title": "GPU MODE advanced quantization materials",
+        "url": "https://github.com/gpu-mode/lectures#lecture-7-advanced-quantization",
+        "type": "Course",
+        "why": "Connect quantization math to CUDA and Triton execution choices.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Deployment Preparation (L17)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/lecture_slides/lecture_17.pdf",
+        "type": "Course",
+        "why": "Cross-check speculative decoding and quantization deployment tradeoffs against your probability and numerical experiments.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Error, outliers, and packing cost",
+      "path": "labs/05_quantization.py",
+      "command": "python3 labs/05_quantization.py",
+      "task": "Run the CPU numerical reference; extend group size, outlier distributions, and activation-weighted error. Optional: benchmark a real packed GPU kernel.",
+      "success": "Report payload plus metadata, reconstruction/output error, and distinguish numerical simulation from hardware acceleration."
+    },
+    "completion": [
+      "Quantizer tested on zero groups, outliers, and saturation.",
+      "Held-out quality protocol with paired outcomes.",
+      "A precision–memory–goodput tradeoff table."
+    ]
+  },
+  {
+    "id": "18",
+    "slug": "latent-sparse-and-hybrid-attention",
+    "title": "The cache is part of the architecture",
+    "subtitle": "Derive state from the model instead of assuming every layer is a transformer.",
+    "phase": 5,
+    "week": 18,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "MLA",
+      "Sparse attention",
+      "Hybrid models"
+    ],
+    "outcomes": [
+      "Derive cache storage for GQA, latent attention, windows, and recurrent state.",
+      "Separate exact algebraic changes from approximate sparsification.",
+      "Design cache rollback and prefix reuse for heterogeneous layers."
+    ],
+    "body": "An inference engine often begins with one mental picture: each layer appends a key and value for every token. That picture is convenient and increasingly incomplete. A model may compress keys and values into a shared latent vector, attend to a selected subset of positions, retain only a sliding suffix, or maintain a recurrent state with fixed size. These are different computational contracts. The right engine starts with a per-layer state inventory and derives memory, updates, reuse, and rollback from that inventory.\n\n## Derive latent attention by moving linear maps\n\n[DeepSeek-V2](https://arxiv.org/abs/2405.04434) is a concrete introduction to multi-head latent attention, or MLA. To understand the idea, temporarily ignore positional terms. Suppose a token produces latent state $c_t\\in\\mathbb{R}^r$, and head $h$ reconstructs $k_t^h=W_K^hc_t$ and $v_t^h=W_V^hc_t$. A query's score satisfies\n\n$$(q^h)^T k_t^h=(q^h)^TW_K^hc_t=((W_K^h)^Tq^h)^Tc_t.$$\n\nInstead of materializing every full key, transform the query and compare it with the cached latent. For the output,\n\n$$\\sum_t a_t^h v_t^h=W_V^h\\left(\\sum_t a_t^h c_t\\right).$$\n\nThe linear reconstruction can move outside the sum. This is an algebraic explanation of potential reuse, not the full DeepSeek implementation. Positional components need separate treatment, and learned projections and dimensions are architecture specific. Implement the simplified identities numerically before studying how actual positional information changes the cache.\n\n## Compare state bytes before latency\n\nCompare storage with a deliberately hypothetical configuration. GQA with 32 layers, eight KV heads, head width 128, and BF16 stores $2\\times32\\times8\\times128\\times2=131072$ bytes per token. A latent design storing 512 latent elements plus 64 positional elements per layer stores $32\\times(512+64)\\times2=36864$ bytes per token. The ratio is about 3.56. At 8192 positions those totals are 1 GiB and 288 MiB. These are teaching dimensions, not a claim about a named checkpoint. The latter calculation assumes one shared positional component of the stated width per layer; verify actual shapes before applying it.\n\nLess storage does not automatically imply proportionally less latency. Transformed queries can be wider than original heads, and reconstruction may move compute into another stage. Cache layout, split reductions, low-precision representation, and batch occupancy determine the actual kernel. [FlashMLA](https://github.com/deepseek-ai/FlashMLA) is the implementation resource: inspect its supported modes and hardware for your pinned version rather than transferring one benchmark to every attention configuration.\n\n## Account for the cost of selecting sparse positions\n\nSparse attention changes a different axis: which positions are read. If each query attends to $k$ of $s$ historical positions, its main attention work can shrink toward $O(kd)$ rather than $O(sd)$. But selecting those $k$ positions may itself require a scan, index lookup, or learned routing computation. Irregular gathers can waste bandwidth. Report selector time, attention time, and end-to-end time separately. A mask required by the trained architecture is part of the model; dropping extra positions from a dense model is an approximation and needs quality evaluation.\n\n## Preserve windows through speculative rollback\n\nSliding windows have a useful bounded-state property. A window of 256 positions does not need to retain 8192 old positions for that layer's local attention. Yet a model containing both windowed and global layers still has a global cache component. Moreover, speculative decoding requires the ability to restore the window after rejected tokens. If a ring buffer overwrites old entries while draft tokens are uncommitted, rolling back only the write pointer cannot recover destroyed values. Keep a bounded undo area or delay destructive overwrites until commitment.\n\n## Version every component of hybrid state\n\nRecurrent layers introduce another state shape. A simplified update $s_t=As_{t-1}+Bx_t$ keeps state size independent of sequence length, but a prefix branch needs the state at the branch point. [Mamba](https://arxiv.org/abs/2312.00752) provides a real selective-state architecture to examine beyond this toy recurrence. You cannot assume a conventional KV page table represents every layer correctly. Checkpointing recurrent states trades memory against replay work, and speculative rollback must restore a complete consistent version.\n\nConsider prefix sharing in a hybrid model. Two requests sharing 4000 tokens can reuse global-attention pages, a final recurrent state at position 4000, and the last window suffix. Reusing only the global pages produces an inconsistent execution state even if those pages are correct. Cache identity must include model weights, adapter, positional scheme, precision, token prefix, and any modality preprocessing that changes model inputs. A shared prefix is a semantic object before it is a hash-table entry.\n\nMemory reclamation also changes with state type. Immutable attention prefix pages can be reference counted, while a recurrent state updated in place must be copied before requests diverge. Give each request a logical state version and make sharing explicit. A useful adversarial test forks two requests at one prefix, advances only one, then verifies that the untouched request's next output is unchanged. This catches aliasing bugs that ordinary single-request numerical comparisons cannot expose.\n\n## Build an architecture-aware experiment\n\nThe CPU cost-model lab is your starting point. Extend it with a list of layer types and explicit retained-state formulas. Then write a tiny algebra check for the absorbed latent equations and a ring-buffer rollback test that crosses its wrap boundary. Plot bytes per request against context length: global layers grow linearly, window layers plateau, and fixed-state layers stay flat. The sum reveals the real service limit. For hardware follow-up, profile only a supported implementation and clearly distinguish reduced state, reduced traffic, and measured latency. The durable skill is deriving engine invariants from architecture instead of forcing every model into yesterday's cache abstraction.",
+    "exercises": [
+      {
+        "title": "Inventory a hybrid cache",
+        "prompt": "A model has 8 global layers and 24 window layers, each storing 4096 bytes per retained token. Context is 4096 tokens, window is 256. Ignore other state. Compute cache memory.",
+        "hint": "Count retained token-layer pairs first.",
+        "solution": "Global state: 8×4096×4096=134,217,728 bytes=128 MiB. Window state:24×256×4096=25,165,824 bytes=24 MiB. Total=152 MiB. Treating all 32 layers as global would predict 512 MiB."
+      },
+      {
+        "title": "Prove the absorbed value path",
+        "prompt": "Given a_t scalar, c_t vectors, and fixed matrix W, show why sum_t a_t Wc_t = W sum_t a_t c_t, and identify a transformation that would invalidate moving it outside.",
+        "hint": "Use linearity; nonlinear operations do not generally commute with the sum.",
+        "solution": "Matrix multiplication distributes across addition and scalar multiplication. A nonlinear map such as ReLU(Wc_t) cannot generally move outside: sum a_t ReLU(Wc_t) differs from ReLU(W sum a_t c_t). Token-dependent W_t also prevents using one common outside matrix."
+      },
+      {
+        "title": "Catch destructive rollback",
+        "prompt": "A window buffer holds positions 0–3. Draft positions 4–5 overwrite slots 0–1, then both are rejected. Why is resetting the pointer insufficient?",
+        "hint": "The pointer records location, not the overwritten content.",
+        "solution": "Positions 0–1 were destroyed but may be needed by the restored window. Save overwritten entries in an undo buffer, use copy-on-write pages, or stage draft values separately until acceptance. Test exact state restoration across the wrap boundary and multiple rejection lengths."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Which property justifies moving a shared value projection outside weighted summation?",
+        "options": [
+          "Sparsity",
+          "Linearity",
+          "Quantization",
+          "Causal masking"
+        ],
+        "answer": 1,
+        "explanation": "A fixed linear matrix distributes over addition and scalar weighting, allowing W to move outside the sum. A token-dependent matrix or a nonlinear operation generally would not obey the same identity."
+      },
+      {
+        "question": "Why can a sparse attention kernel fail to reduce end-to-end latency?",
+        "options": [
+          "Sparse attention always reads every token",
+          "Its outputs are necessarily wrong",
+          "Selection and irregular gathers can dominate",
+          "KV never affects latency"
+        ],
+        "answer": 2,
+        "explanation": "Selecting positions, loading indices, and gathering irregular memory can outweigh the attention work removed. Measure selector time and the full request, not only the sparse attention kernel in isolation."
+      },
+      {
+        "question": "What must a hybrid prefix cache preserve?",
+        "options": [
+          "Only token IDs",
+          "Only global KV pages",
+          "Only the latest output",
+          "All architecture-specific state at the same prefix boundary"
+        ],
+        "answer": 3,
+        "explanation": "Every reused state component must describe the same prefix boundary. Global KV, a window suffix, and recurrent state can each be individually valid yet produce a wrong continuation when their versions disagree."
+      },
+      {
+        "question": "Which claim requires a quality study?",
+        "options": [
+          "Dropping extra keys from an otherwise dense model",
+          "Changing a mathematically equivalent layout",
+          "Replicating identical immutable pages",
+          "Moving a fixed linear projection algebraically"
+        ],
+        "answer": 0,
+        "explanation": "Extra key dropping changes which evidence contributes to the output of a dense model. It therefore needs task-quality evaluation, unlike an algebraically equivalent layout or correctly replicated immutable state."
+      },
+      {
+        "question": "What happens to window-layer storage after context exceeds the window?",
+        "options": [
+          "It grows quadratically",
+          "It can plateau, excluding rollback and metadata overhead",
+          "It becomes zero",
+          "It equals all global state"
+        ],
+        "answer": 1,
+        "explanation": "A windowed layer only retains its bounded suffix once the context is longer than the window. Memory can therefore plateau, but rollback buffers, metadata, and any global layers still contribute to total state."
+      }
+    ],
+    "resources": [
+      {
+        "title": "DeepSeek-V2",
+        "url": "https://arxiv.org/abs/2405.04434",
+        "type": "Paper",
+        "why": "Read MLA equations and distinguish latent and positional state.",
+        "required": true
+      },
+      {
+        "title": "FlashMLA",
+        "url": "https://github.com/deepseek-ai/FlashMLA",
+        "type": "Repository",
+        "why": "Inspect real cache shapes, kernels, and supported hardware.",
+        "required": true
+      },
+      {
+        "title": "Mamba",
+        "url": "https://arxiv.org/abs/2312.00752",
+        "type": "Paper",
+        "why": "Study a selective-state model and its inference-state implications.",
+        "required": true
+      }
+    ],
+    "lab": {
+      "title": "Architecture-aware memory model",
+      "path": "labs/01_cost_model.py",
+      "command": "python3 labs/01_cost_model.py",
+      "task": "Extend the cost model with mixed global/window/latent/recurrent layer inventories and add algebra/rollback checks.",
+      "success": "Produce byte-count curves and catch a ring-buffer rollback bug without claiming GPU performance."
+    },
+    "completion": [
+      "Per-layer state inventory with explicit dimensions.",
+      "Numerically verified latent identities.",
+      "Rollback and prefix-sharing invariants for a hybrid model."
+    ]
+  },
+  {
+    "id": "19",
+    "slug": "deepinfer-source-study",
+    "title": "Read DeepInfer like a systems researcher",
+    "subtitle": "Turn a production-derived release into falsifiable local experiments.",
+    "phase": 5,
+    "week": 19,
+    "minutes": 35,
+    "level": "Research",
+    "hardware": "CPU",
+    "tags": [
+      "DeepInfer",
+      "Source reading",
+      "Reproduction"
+    ],
+    "outcomes": [
+      "Map a pinned release to explicit supported and missing components.",
+      "Trace an optimization from example to policy, invariant, and test.",
+      "Reproduce a mechanism without overstating hardware or production equivalence."
+    ],
+    "body": "A large open-source release can create the illusion that understanding its configuration flags means understanding the system. Reverse that relationship. Choose a performance claim, identify the mechanism that could make it true, trace the state and numerical invariants, then construct the smallest experiment capable of disproving your interpretation. DeepInfer is an advanced case study because kernels, expert placement, scheduling, model architecture, and reproducibility interact in one repository.\n\n## Freeze the release and its scope\n\nThis lesson pins source inspected on October 21, 2026 to commit `9bd9cf243fc53ef9afbf8f04d391d989117d6ab9`. The [README](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/README.md) identifies offline inference for DeepSeek-V4.1-Flash, NVIDIA SM100 GPUs and Huawei Ascend 950 NPUs. It includes optimized kernels, expert balancing, speculative features, asynchronous scheduling, and specified reproducibility modes. It explicitly excludes the complete service KV system, vision/prefill/decode disaggregation deployment, and balancing across serving replicas. Source-level support for engine phases is not the same as a turnkey production service. These release facts have high confidence for the pinned snapshot; later versions require a fresh audit.\n\n## Follow the runnable path and its guards\n\nStart with a runnable path on paper. In [examples/offline_inference.py](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/offline_inference.py), follow argument parsing, parallel-size relationships, common environment setup, engine construction, prompt preparation, generation, and output validation. Record shapes and ownership at each boundary. The example checks output structure and finite log probabilities and reports draft acceptance statistics. Those checks are useful evidence of intended behavior, but they do not establish production reliability or reproduce the throughput plots. Write a call graph with links to symbols, not a list of imported modules.\n\nNext inspect [csrc/engine/scheduler.hpp](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp). Its engine-type distinction and constructor checks expose operational assumptions. For example, the completion-only engine rejects a configuration that would require recomputing preempted work through a nonexistent prefill channel. Translate this into a state-machine invariant: every recovery transition needs an execution path capable of rebuilding the state it discards. Find admission, abort, and cache-related transitions; for each, identify which component owns the sequence afterward. A useful code-reading note predicts a concrete failure if one guard were removed.\n\n## Reproduce the expert-placement objective\n\nChoose expert placement as your first bounded reproduction. [deepinfer/model_executor/eplb/policy.py](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/eplb/policy.py) distinguishes logical experts from physical copies, assigns redundant copies, and places them using historical per-step load. The greedy placement evaluates an objective based on sums of per-step rank maxima. This is more informative than equalizing each expert's total historical tokens because correlations between experts matter. The returned maps are part of correctness: changing placement must not change which logical function a token receives.\n\nA tiny counterexample explains the objective. Four experts have loads across two steps: $A=(10,0)$, $B=(10,0)$, $C=(0,10)$, and $D=(0,10)$. Every expert has total load ten. With two experts per rank, placement $(A,B)$ and $(C,D)$ produces rank loads $(20,0)$ then $(0,20)$, so the sum of step maxima is 40. Placement $(A,C)$ and $(B,D)$ produces $(10,10)$ at both steps, so the objective is 20. Aggregate totals cannot distinguish these layouts, but their synchronized critical paths differ by a factor of two in this linear toy model.\n\nReimplement that objective in a few lines, enumerate all legal placements for the tiny case, and compare a greedy policy with the exhaustive optimum. Then add noisy measurements and a phase change. This separates three claims: the mathematical objective captures an intended bottleneck, the algorithm approximately optimizes it, and optimizing it improves real accelerator latency. Only the first two are accessible through the CPU teaching experiment. A real GPU result needs dispatch, expert GEMMs, communication, and migration overhead measured on supported hardware.\n\n## Separate implementation from deployment claims\n\nRead the [deployment Q&A](https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md) as architecture context. It describes production choices and systems beyond the release. Maintain a three-column evidence ledger: repository implementation, author-reported deployment, and your independently measured result. Do not turn author-reported cluster numbers into results of your reproduction. If a detail appears only in prose, label it as a design description and identify the missing experiment or code needed to verify it.\n\n## Bound the benefit of scheduler overlap\n\nFor a second study, examine CPU/device overlap with a critical-path model. If device work costs 8 ms and CPU scheduling 3 ms, serial execution costs 11 ms. Ideal overlap costs at least 8 ms, yielding an upper-bound speedup of 1.375 before coordination. A 2× observed improvement would need another explanation, such as changed batching, removed synchronization, or a different workload. This arithmetic makes you a better source reader: optimistic marketing language becomes a measurable claim about a timeline.\n\n## Turn source reading into a regression argument\n\nTreat tests as executable statements of intent. Locate the policy tests, identify which invariants they assert, and design one missing adversarial input rather than assuming coverage is complete. Empty history, equal loads, insufficient physical slots, and alternating hot experts probe different assumptions. A passing test suite increases confidence only in the properties actually checked. Record your additional case and the expected outcome so the source note becomes a reusable regression argument instead of a one-time reading summary.\n\nUse the experiment template to capture commit, submodules, dependencies, model checkpoint, exact flags, hardware topology, and workload. Build nothing merely to prove enthusiasm; on unsupported hardware, finish the policy reproduction and source map. On supported hardware, begin with the repository's documented example and checks before altering a single mechanism. Your exit artifact is a technical note with a falsifiable hypothesis, a minimal reproducer, at least one counterexample, and a clear boundary between confirmed code behavior and untested production inference.",
+    "exercises": [
+      {
+        "title": "Expose correlated expert loads",
+        "prompt": "Use A=(8,0), B=(8,0), C=(0,8), D=(0,8), two ranks and two experts per rank. Compare grouping same-phase experts with mixing phases.",
+        "hint": "Compute max rank load separately at every step before summing.",
+        "solution": "Same-phase placement gives maxima 16 and 16, sum 32. Mixed-phase placement gives 8 and 8, sum 16. All experts have equal total load, demonstrating why aggregated counts miss correlation."
+      },
+      {
+        "title": "Bound scheduler overlap",
+        "prompt": "Device work is 12 ms, CPU scheduling is 4 ms, and overlap coordination costs an additional 1 ms. Estimate idealized serial and overlapped time.",
+        "hint": "Assume perfect overlap only for the independent work.",
+        "solution": "Serial time is 16 ms. Overlap is max(12,4)+1=13 ms. Speedup is 16/13≈1.231. This is a model prediction; verify dependencies and whether coordination is on the critical path."
+      },
+      {
+        "title": "Build the evidence ledger",
+        "prompt": "A README lists offline inference, a Q&A describes persistent cluster cache, and your CPU simulator improves a placement objective by 20%. State three defensible claims.",
+        "hint": "Keep implementation, author report, and your experiment separate.",
+        "solution": "Claim 1: the pinned release documents offline inference. Claim 2: authors describe a production persistent-cache architecture, but this is not established as a complete released service. Claim 3: the CPU experiment improves its specified synthetic objective by 20%; no accelerator latency or production goodput improvement has been demonstrated."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "What is the correct status of a CPU EPLB experiment?",
+        "options": [
+          "A reproduction of all DeepInfer benchmarks",
+          "Evidence about the policy mechanism under its modeled workload",
+          "A production deployment",
+          "Proof of multi-node communication speed"
+        ],
+        "answer": 1,
+        "explanation": "The CPU experiment can validate mapping invariants and a placement objective on specified synthetic loads. It does not measure accelerator kernels, communication, migration, or end-to-end production serving."
+      },
+      {
+        "question": "Why pin a source commit in a research note?",
+        "options": [
+          "Main branches never change",
+          "It makes GPU execution deterministic",
+          "It identifies the exact implementation supporting the claim",
+          "It avoids numerical tests"
+        ],
+        "answer": 2,
+        "explanation": "A commit fixes the implementation and documentation that the analysis refers to. A moving branch may change algorithms, defaults, or supported hardware, making a formerly accurate description impossible to reproduce."
+      },
+      {
+        "question": "Which implementation detail changes no logical expert identity?",
+        "options": [
+          "Copying an expert and updating physical placement maps correctly",
+          "Routing to a different expert",
+          "Dropping busy assignments",
+          "Changing router weights"
+        ],
+        "answer": 0,
+        "explanation": "Correct placement maps select an identical copy of the same logical expert and preserve the routing weights. Changing the selected logical expert or dropping work would alter the model function instead."
+      },
+      {
+        "question": "A 10 ms GPU stage overlaps a 2 ms CPU stage. Ignoring overhead, serial-to-overlapped speedup is bounded by:",
+        "options": [
+          "2×",
+          "5×",
+          "12×",
+          "1.2×"
+        ],
+        "answer": 3,
+        "explanation": "Serial execution costs 10+2 = 12 ms. Perfectly overlapping the independent stages reduces the lower bound to max(10,2) = 10 ms, so the ideal speedup is 12/10 = 1.2 before coordination overhead."
+      },
+      {
+        "question": "Which hardware claim is supported by the pinned README?",
+        "options": [
+          "Every CUDA GPU is supported",
+          "The released NVIDIA path targets SM100",
+          "An RTX 4090 reproduces the full benchmark",
+          "Only CPU inference exists"
+        ],
+        "answer": 1,
+        "explanation": "The pinned README explicitly lists SM100 for the NVIDIA path. That statement does not imply support for every CUDA-capable GPU or that a smaller consumer GPU can reproduce the published configuration."
+      }
+    ],
+    "resources": [
+      {
+        "title": "DeepInfer pinned README",
+        "url": "https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/README.md",
+        "type": "Repository",
+        "why": "Verify release scope and hardware before reading claims.",
+        "required": true
+      },
+      {
+        "title": "DeepInfer expert placement policy",
+        "url": "https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/deepinfer/model_executor/eplb/policy.py",
+        "type": "Repository",
+        "why": "Trace the logical-to-physical maps and historical-load objective.",
+        "required": true
+      },
+      {
+        "title": "DeepInfer scheduler",
+        "url": "https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/csrc/engine/scheduler.hpp",
+        "type": "Repository",
+        "why": "Find state transitions and recovery constraints.",
+        "required": true
+      },
+      {
+        "title": "DeepInfer deployment Q&A",
+        "url": "https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/doc/inference_deployment_qa.md",
+        "type": "Documentation",
+        "why": "Separate authors’ production descriptions from released components.",
+        "required": true
+      },
+      {
+        "title": "DeepInfer offline example",
+        "url": "https://github.com/deepseek-ai/DeepInfer/blob/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9/examples/offline_inference.py",
+        "type": "Repository",
+        "why": "Follow arguments into execution and validation.",
+        "required": true
+      }
+    ],
+    "lab": {
+      "title": "Pinned mechanism reproduction",
+      "path": "docs/EXPERIMENT_TEMPLATE.md",
+      "command": "python3 labs/06_moe.py",
+      "task": "Use the CPU MoE lab as a starting point; reproduce the correlated-load objective and complete a source-linked research note. Hardware reproduction is a separate optional extension.",
+      "success": "A pinned call graph, exhaustive tiny-case check, and evidence ledger with no unsupported hardware claims."
+    },
+    "completion": [
+      "Source map pinned to an exact commit.",
+      "Mechanism reproduction with a counterexample.",
+      "Claims separated by implementation, author report, and independent measurement."
+    ]
+  },
+  {
+    "id": "20",
+    "slug": "vlm-visual-token-budgets",
+    "title": "Pixels become queueing decisions",
+    "subtitle": "Serve images by their computational shape and information value.",
+    "phase": 6,
+    "week": 20,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "1 GPU",
+    "tags": [
+      "VLM",
+      "Visual tokens",
+      "Multimodal serving"
+    ],
+    "outcomes": [
+      "Trace image bytes through preprocessing, encoding, and language decoding.",
+      "Estimate visual-token and cache cost before admission.",
+      "Measure a task-specific resolution–latency tradeoff with correct cache identity."
+    ],
+    "body": "A vision-language request begins before the language model sees a token. Image transfer, decompression, resize, crop generation, normalization, device transfer, visual encoding, projection, language prefill, and output generation can each dominate a different workload. Optimizing the decoder while ignoring an overloaded CPU image pipeline is a common failure. Draw the complete timeline first, and give every stage an input size, output size, queue, and measurement boundary.\n\n## Count computational shapes, not images\n\nThe key conceptual move is to stop counting images and start counting computational shapes. A tiny image and a high-resolution document may both be one request but produce very different numbers of visual tokens. [Qwen2-VL](https://arxiv.org/abs/2409.12191) is a useful dynamic-resolution example; [Qwen2.5-VL](https://arxiv.org/abs/2502.13923) adds another architecture to compare. The point is not that these are universally best models. Their explicit processing choices make the conversion from pixels into sequence work inspectable.\n\n## Derive pixels, tokens, and prefill work\n\nUse a simple hypothetical processor to make the conversion concrete. An image of width $W$ and height $H$, patch size $p$, and spatial merge factor $m$ per dimension produces approximately\n\n$$N_v=\\frac{\\lceil W/p\\rceil\\lceil H/p\\rceil}{m^2}$$\n\nvisual tokens, assuming compatible padding and no additional crops or special tokens. For a 448×448 image with $p=14$ and $m=2$, there are 1024 patches and 256 merged tokens. At 896×896, there are 4096 patches and 1024 merged tokens. Doubling each side quadruples the visual sequence. Real processors may resize to supported multiples, create tiles, or add temporal grouping; read the processor's returned grid and count actual embeddings rather than treating this approximation as a universal formula.\n\nIf the text prompt has 256 tokens, these examples produce language prefill lengths 512 and 1280 before special tokens. A dense attention score component scales roughly with sequence length squared, so its operation-count ratio is $(1280/512)^2=6.25$. MLP and projection terms grow linearly, and optimized kernels change runtime behavior, so the whole prefill is not automatically 6.25 times slower. Cache growth is linear in the inserted visual positions for ordinary causal self-attention. This one example shows why a pixel budget affects both latency and concurrency.\n\n## Spend resolution on task-relevant evidence\n\nQuality determines how far resolution can shrink. A scene-category question may need coarse layout; reading a serial number requires small glyphs to survive preprocessing. Build evaluation slices for small text, spatial relations, counting, fine-grained recognition, and document structure. Hold prompts and output budgets fixed while varying pixel/token limits. Record task scores per slice and confidence intervals, not merely whether the outputs look plausible. A low-resolution model that confidently invents digits has not satisfied an OCR task even if its average description sounds correct.\n\nDynamic policies can allocate pixels by task. A cheap first pass might identify a relevant region and a second pass inspect that crop at higher resolution. Account for both passes, routing errors, and added queueing. Compare against a fixed-budget baseline with the same average compute and against a strong full-resolution reference. If the first pass misses the relevant region, the second pass cannot recover information it never receives. This creates a measurable quality–latency frontier rather than a blanket claim that fewer visual tokens are better.\n\n## Cache the exact visual computation\n\nFeature caching can remove repeated encoder work, but its identity is richer than the image filename. Include image content, crop/resize policy, normalization, model and processor versions, adapter, precision, and any position-dependent representation. Cache raw encoder embeddings only when their contract allows reuse across prompts; multimodal decoder KV depends on surrounding sequence context and positions. Two identical image bytes inserted at different positions may share encoder work while requiring different language-model state. Validate reuse against uncached logits on a small deterministic case.\n\n## Budget each stage of a multimodal batch\n\nBatching must recognize modality heterogeneity. Grouping images by shape can reduce padding, but waiting too long to fill a shape bucket harms latency. Large visual requests can also monopolize language prefill. Introduce separate budgets for encoder pixels or patches, language tokens, and KV memory. Reserve capacity across stages so a finished encoder does not produce an unlimited queue of embeddings awaiting prefill. If you disaggregate the vision encoder, count embedding transport and serialization instead of assuming it is free.\n\n## Measure the whole request\n\nThe measurement record should contain image bytes received, decoded dimensions, crop count, patch grid, actual visual-token count, preprocessing duration, encoder queue and execution time, prefill queue and execution time, output tokens, and user-visible completion time. Define TTFT from request arrival including image transport if that is what the application experiences; also report a server-received boundary if network conditions are variable. These two measurements answer different questions and should not be merged.\n\nThe supplied cost-model lab is a CPU baseline for sequence and memory accounting. This week's extension adds the hypothetical visual processor and stage costs; it does not run a pretrained VLM. For a GPU project, choose a supported checkpoint, pin its processor, and build a small held-out visual workload. Reproduce actual token counts before optimizing. Your final artifact should show which resolution policy meets a concrete task-quality target at the lowest SLO-qualified cost, plus at least one image category where reducing visual tokens fails.",
+    "exercises": [
+      {
+        "title": "Budget a visual prompt",
+        "prompt": "For a hypothetical 672×448 image, p=14 and m=2, compute visual tokens. Add a 512-token text prompt and calculate cache bytes at 64 KiB per token.",
+        "hint": "Both dimensions divide exactly; ignore special tokens as stated.",
+        "solution": "Patches=(672/14)×(448/14)=48×32=1536. Merged visual tokens=1536/4=384. Total=896 tokens. Cache=896×65536=58,720,256 bytes=56 MiB, before output tokens and metadata."
+      },
+      {
+        "title": "Identify the bottleneck",
+        "prompt": "A request takes 45 ms preprocessing, 20 ms encoding, 15 ms prefill, and 20 ms decode. You halve decode time. What is end-to-end speedup?",
+        "hint": "Sum the complete timeline, assuming serial stages.",
+        "solution": "Original=100 ms. New=45+20+15+10=90 ms. Speedup=100/90≈1.111. The decoder improved 2× but whole-request latency only 10%; preprocessing deserves investigation."
+      },
+      {
+        "title": "Design a reusable feature key",
+        "prompt": "Two requests use the same JPEG but different crops and adapters. What should an encoder-feature cache key include?",
+        "hint": "Cache identity must describe the actual computation.",
+        "solution": "Include content digest, crop coordinates, resize/padding, normalization, processor version, encoder weights/version, adapter if it changes the encoder, and precision. If only the language adapter differs, encoder reuse may remain valid but decoder KV reuse still needs its own complete identity. Prove the intended boundary with uncached equivalence tests."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Doubling both dimensions of an image usually changes patch count by:",
+        "options": [
+          "2×",
+          "4×",
+          "8×",
+          "No change"
+        ],
+        "answer": 1,
+        "explanation": "At fixed patch size and compatible dimensions, doubling width and height multiplies image area by four. Patch count follows area, before any model-specific resizing, tiling, merging, or token caps."
+      },
+      {
+        "question": "Why should image count not be the sole encoder batch budget?",
+        "options": [
+          "Every image has identical shape",
+          "Text is always more expensive",
+          "Resolution and crop counts produce very different work",
+          "Encoders require no memory"
+        ],
+        "answer": 2,
+        "explanation": "Images can differ greatly in dimensions, tiling, and crop count. Those choices determine patch work and memory, so a batch of ten small images need not cost as much as one large document."
+      },
+      {
+        "question": "What is required before reusing decoder KV for the same image?",
+        "options": [
+          "A matching file extension",
+          "A matching JPEG filename",
+          "Only equal pixel dimensions",
+          "Matching model/input/position context and cache semantics"
+        ],
+        "answer": 3,
+        "explanation": "Decoder KV depends on the complete model input, token positions, and model configuration. Identical image bytes may allow encoder-feature reuse while still producing different context-dependent decoder state."
+      },
+      {
+        "question": "Which quality slice is especially likely to fail after aggressive downsampling?",
+        "options": [
+          "Small-text recognition",
+          "Broad scene color",
+          "Image transfer speed",
+          "CPU allocation"
+        ],
+        "answer": 0,
+        "explanation": "Aggressive downsampling can erase small glyphs before encoding, so the lost evidence is unavailable to the language model. Good broad-scene descriptions do not demonstrate preserved OCR performance."
+      },
+      {
+        "question": "A 6.25× dense attention operation increase implies what about total prefill latency?",
+        "options": [
+          "Exactly 6.25× latency",
+          "No fixed total latency ratio without the other terms and measured kernels",
+          "Exactly 2.5× latency",
+          "Always unchanged"
+        ],
+        "answer": 1,
+        "explanation": "The 6.25 ratio applies to the modeled dense attention component, not the entire prefill. Linear projections, MLP work, padding, and hardware utilization must be included before predicting total latency."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Qwen2-VL",
+        "url": "https://arxiv.org/abs/2409.12191",
+        "type": "Paper",
+        "why": "Study how dynamic resolution becomes variable-length visual input.",
+        "required": true
+      },
+      {
+        "title": "Qwen2.5-VL Technical Report",
+        "url": "https://arxiv.org/abs/2502.13923",
+        "type": "Paper",
+        "why": "Compare visual encoding and time/position handling.",
+        "required": true
+      },
+      {
+        "title": "Qwen2.5-VL processor documentation",
+        "url": "https://huggingface.co/docs/transformers/model_doc/qwen2_5_vl",
+        "type": "Documentation",
+        "why": "Inspect actual processor controls and returned visual grids for a pinned version.",
+        "required": true
+      }
+    ],
+    "lab": {
+      "title": "Visual request cost accounting",
+      "path": "labs/01_cost_model.py",
+      "command": "python3 labs/01_cost_model.py",
+      "task": "Extend CPU cost accounting with patch grids and visual tokens; optional GPU work measures a pinned VLM processor and resolution-quality sweep.",
+      "success": "Explain predicted versus actual visual token counts and include a fine-detail failure slice."
+    },
+    "completion": [
+      "End-to-end multimodal timeline with explicit boundaries.",
+      "Pixel/token/KV budget verified against processor output.",
+      "Resolution-quality Pareto curve with held-out visual tasks."
+    ]
+  },
+  {
+    "id": "21",
+    "slug": "streaming-video-freshness",
+    "title": "A fast answer to an old frame is still old",
+    "subtitle": "Design causal streams around age, deadlines, and evidence.",
+    "phase": 6,
+    "week": 21,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "Streaming video",
+      "Freshness",
+      "Causality"
+    ],
+    "outcomes": [
+      "Distinguish processing latency, observation age, and update cadence.",
+      "Compare FIFO, dropping, and latest-observation queues under overload.",
+      "Preserve arrival-time provenance and causal cache semantics."
+    ],
+    "body": "A video service can process every frame efficiently and still describe a scene that no longer exists. This happens when capture outpaces inference and an obedient FIFO queue preserves all the wrong work. Real-time perception needs an explicit contract about timeliness: how old may the evidence be when the answer is used, which brief events must be retained, and what should happen when the server cannot keep up? Raw frames per second cannot answer those questions.\n\n## Define age separately from processing latency\n\nRecord at least four times for each observation: capture, arrival at the service, inference start, and result availability. Processing latency is result time minus inference start. End-to-end observation latency is result time minus capture. At wall time $t$, age of information is\n\n$$A(t)=t-u(t),$$\n\nwhere $u(t)$ is the capture timestamp of the freshest observation represented by the latest available result. The [Age of Information survey](https://www.mit.edu/~modiano/papers/CV_J_122preprint.pdf) develops this timeliness perspective. A result can have low processing latency but high age because it waited in transport or a queue. Between results, age grows even when no inference is running.\n\n## Watch a FIFO queue fall behind\n\nWork through a deterministic timeline. Frames arrive every 50 ms, while inference takes 200 ms. FIFO begins frame zero at 0 ms and returns it at 200 ms, then begins the frame captured at 50 ms and returns it at 400 ms. The second result is already 350 ms old. After $n$ completed frames, age at completion is $200n-50(n-1)=150n+50$ ms. The queue grows without bound because arrival rate is 20/s and service rate is 5/s.\n\nNow keep only the latest waiting frame while allowing the active inference to finish. At 200 ms, choose the newest frame available, captured at 200 ms under a stated tie-ordering rule; it finishes at 400 ms with age 200 ms. At each completion, age remains near service time, and immediately before the next completion it can approach 400 ms. If capture is asynchronous, add up to one capture interval to these simple bounds. Report both age at result delivery and time-average or high-percentile age over the whole timeline; sampling only completions hides the stale intervals between them.\n\n## Replace waiting work without starving active work\n\nDo not confuse replacement of waiting work with preemption of active work. Cancelling a 200 ms inference every time a 50 ms frame arrives can prevent any result from completing. A practical default is one non-preemptive active item plus one replaceable pending item, with deadline checks before starting expensive work. True preemption is useful only if execution can resume or partial work has value and cancellation overhead is controlled. Measure the policy rather than assuming that maximum freshness means restarting constantly.\n\n## Protect the events that dropping can erase\n\nDropping frames is not universally correct. A 100 ms event between sampled observations can disappear, and a latest-only service may never report it. Maintain a lightweight event path or a bounded history buffer when transient recall matters. One design uses cheap motion or detector updates at high frequency and slower semantic descriptions asynchronously. Late semantic results attach to their source interval and track IDs instead of overwriting the present state. Evaluate both freshness and event recall; improving one can damage the other.\n\n## Preserve time and information provenance\n\nTime provenance is especially important with multiple cameras. Capture clocks may disagree, arrivals may be reordered, and network jitter may differ by stream. Record clock domain, synchronization estimate, and uncertainty. Never subtract timestamps from unrelated monotonic clocks as though they shared an epoch. When combining observations, store their capture intervals separately. A sentence produced at 12:00:05 from frames captured at 12:00:01 is evidence about the earlier scene, even if its text is confident.\n\nCausal evaluation must replay arrival order. If a model caches representations as observations arrive, later questions, future camera calibration, or future frame selection cannot retroactively change the earlier cached computation unless the system explicitly recomputes it and charges that cost. Freeze the metadata available at each arrival. Compare a live causal mode against any offline oracle as separate experiments. A retrospective video benchmark can be useful, but it does not establish streaming behavior merely because outputs are emitted one at a time.\n\n## Evaluate timely recall as well as freshness\n\nFor an illustrative optimization objective, define timely recall as the fraction of ground-truth events correctly reported before their deadline. A system detecting 90 of 100 events but only 40 before deadline has timely recall 40%, while a system detecting 80 with 70 on time has 70%. Neither number should replace ordinary recall; show both to reveal the tradeoff. Also measure stale-result overwrites, duplicate reports, per-camera starvation, and how latency changes during bursts.\n\nThe supplied freshness lab is a CPU event simulation, not a live camera or VLM. Run FIFO and latest-observation policies at identical capture and service rates, then vary service-time jitter, transport delays, and short-event durations. Extend it with a separate event-recall calculation and a two-camera fairness rule. For a real service, preserve frame IDs through every stage and log sampled timestamps at output commitment. The final demonstration should make queue age visible, show exactly which frames were skipped, and explain why the chosen policy meets the application's evidence and freshness contract.",
+    "exercises": [
+      {
+        "title": "Trace a stale FIFO",
+        "prompt": "Frames arrive at 0,40,80,... ms; service takes 120 ms. What are the completion time and age for the fourth FIFO frame?",
+        "hint": "The fourth frame is indexed three and was captured at 120 ms.",
+        "solution": "It completes at 4×120=480 ms, giving age 480−120=360 ms. Processing itself took 120 ms; queueing caused the other 240 ms."
+      },
+      {
+        "title": "Measure time-average age",
+        "prompt": "A latest-only system delivers results every 200 ms, each based on an observation 200 ms old. Assuming linear growth between deliveries and no jitter, compute average and peak age.",
+        "hint": "Each interval is a sawtooth from 200 to 400 ms.",
+        "solution": "Average age is (200+400)/2=300 ms. Peak approaches 400 ms just before the next delivery. Reporting only the delivery age of 200 ms understates continuous staleness."
+      },
+      {
+        "title": "Detect future-information leakage",
+        "prompt": "A replay uses camera poses estimated from the full video to encode every earlier frame, while claiming an online unknown-camera system. Design a valid comparison.",
+        "hint": "The information set at encoding time must match deployment.",
+        "solution": "Create causal replay that supplies only poses available by each frame arrival, preserving uncertainty and charging any later recomputation. Compare separately with an offline full-video-pose oracle. If future poses alter earlier cached keys without recomputation, the streaming claim is invalid."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "A frame waits 600 ms then takes 50 ms to process. Its age at delivery is at least:",
+        "options": [
+          "50 ms",
+          "600 ms",
+          "650 ms",
+          "Zero"
+        ],
+        "answer": 2,
+        "explanation": "Age includes the 600 ms queue wait and the 50 ms processing interval, totaling at least 650 ms. Any earlier capture or transport delay makes the evidence older still."
+      },
+      {
+        "question": "Which policy can starve all completions when arrivals are faster than service?",
+        "options": [
+          "Restart active inference on every new frame",
+          "Replace only the pending frame",
+          "Bound the waiting queue",
+          "Finish active work then choose newest"
+        ],
+        "answer": 0,
+        "explanation": "If each arrival restarts work before its service time elapses, no inference may ever finish. Replacing only waiting work permits the active item to complete and avoids this form of starvation."
+      },
+      {
+        "question": "Why can latest-only scheduling reduce event recall?",
+        "options": [
+          "It preserves too much history",
+          "It always duplicates frames",
+          "It increases all model logits",
+          "Short events may occur only in skipped frames"
+        ],
+        "answer": 3,
+        "explanation": "A brief event may exist only in frames that the latest-only policy skips. Fresh results and complete temporal coverage are distinct goals, so event recall must be evaluated alongside age."
+      },
+      {
+        "question": "Which timestamp defines the evidence age of a result?",
+        "options": [
+          "Time its text was rendered",
+          "Capture time of the observation it actually used",
+          "Time a logger flushed",
+          "Current time inserted into the prompt"
+        ],
+        "answer": 1,
+        "explanation": "The capture timestamp locates the evidence in the world timeline. Rendering a result later or inserting the current time into its text does not make the underlying observation more recent."
+      },
+      {
+        "question": "What is required for a causal streaming benchmark?",
+        "options": [
+          "All metadata from the complete recording",
+          "Sorting answers after inference",
+          "Replay using only information available at each arrival",
+          "The word streaming in the API"
+        ],
+        "answer": 2,
+        "explanation": "At each replay step, the model may use only information available by that arrival. Future poses, frames, or questions cannot silently modify earlier cached computation; explicit recomputation must be accounted for."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Age of Information: An Introduction and Survey",
+        "url": "https://www.mit.edu/~modiano/papers/CV_J_122preprint.pdf",
+        "type": "Paper",
+        "why": "Study timeliness metrics and why latency alone is insufficient.",
+        "required": true
+      },
+      {
+        "title": "Qwen2.5-VL Technical Report",
+        "url": "https://arxiv.org/abs/2502.13923",
+        "type": "Paper",
+        "why": "Inspect video time representation; do not equate long-video support with causal streaming.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "FIFO versus fresh observations",
+      "path": "labs/08_freshness.py",
+      "command": "python3 labs/08_freshness.py",
+      "task": "Run the CPU queue simulation and extend it with jitter, brief-event recall, and two-camera fairness.",
+      "success": "Report processing time, delivery age, time-average age, and missed events as distinct quantities."
+    },
+    "completion": [
+      "Timestamp and clock-domain provenance retained.",
+      "FIFO/latest comparison with jitter and overload.",
+      "Causal replay and freshness/recall tradeoff documented."
+    ]
+  },
+  {
+    "id": "22",
+    "slug": "vla-real-time-action-chunking",
+    "title": "The action has a deadline",
+    "subtitle": "Treat inference as part of a closed-loop system, not a token stream.",
+    "phase": 6,
+    "week": 22,
+    "minutes": 35,
+    "level": "Advanced",
+    "hardware": "CPU",
+    "tags": [
+      "VLA",
+      "Action chunking",
+      "Real-time control"
+    ],
+    "outcomes": [
+      "Budget observation-to-action latency at a fixed control rate.",
+      "Design asynchronous chunk execution with explicit temporal alignment.",
+      "Evaluate deadline misses, discontinuities, and closed-loop task outcomes."
+    ],
+    "body": "An action prediction is useful only at the time and state for which it was intended. A robot does not pause its dynamics while a large model finishes thinking. The central systems problem is therefore temporal alignment: which observation generated the action, how much time passed, which actions have already executed, and when the new prediction should take over. A high action-generation rate can coexist with poor control if the generated actions are stale or discontinuous.\n\n## Separate the policy loop from the control loop\n\nSeparate the control loop from the policy inference loop. A low-level controller might consume actions every $\\Delta=20$ ms, or 50 Hz, while a learned policy takes 180 ms to produce a chunk of 25 actions. The chunk covers 500 ms of nominal control time, but inference latency spans nine control ticks. Running inference synchronously and waiting at every chunk boundary creates a 180 ms gap unless another controller supplies behavior. A chunk gives scheduling room; it does not erase the delay between sensing and acting.\n\n## Budget observation-to-action delay\n\nWrite a full observation-to-action budget:\n\n$$T_{oa}=T_{capture}+T_{transport}+T_{queue}+T_{preprocess}+T_{policy}+T_{return}+T_{dispatch}.$$\n\nChoose boundaries carefully: capture can mean exposure midpoint or completed frame acquisition, and actuator dispatch can mean command submission or actual controller application. Document the convention. For an illustrative pipeline with 15 ms capture/transport, 20 ms queue/preprocessing, 120 ms policy, and 25 ms return/dispatch, total latency is 180 ms. Reporting only the 120 ms policy duration understates the feedback delay by one third.\n\n## Reserve enough future actions\n\nAsynchronous execution begins a new inference before the current action buffer runs out. If measured p99 inference-to-delivery latency is 180 ms and control period is 20 ms, at least nine future ticks are needed just to cover that quantile. Reserving eleven ticks adds 40 ms of timing margin. That is a scheduling calculation, not a proof of control stability. Long open-loop intervals can be harmful when contacts, moving targets, or disturbances change the state rapidly. Measure the task's sensitivity to delay rather than choosing horizon solely to eliminate buffer underflow.\n\n## Align chunks while the world moves\n\nTemporal alignment becomes difficult when a new chunk arrives. Suppose a chunk was predicted from observation time $t_0$ and delivered at $t_0+180$ ms. If its first action was intended for $t_0$, playing it now shifts the entire plan nine ticks late. One possible policy discards expired elements and starts at the matching time index, but this assumes the remaining prediction is valid given what actually happened. Another predicts while conditioning on actions that are already committed. [Real-Time Execution of Action Chunking Flow Policies](https://www.pi.website/download/real_time_chunking.pdf) studies asynchronous chunk generation with committed-prefix constraints. Read its algorithm before treating arbitrary chunk concatenation as equivalent.\n\nModel families change the runtime. Autoregressive action tokens require sequential decoding and a conversion to physical commands. Diffusion or flow policies iterate through denoising/integration steps over a chunk. Reducing those steps can lower latency while changing action quality, just as reducing image resolution changes visual evidence. Batch several independent robots only if the resulting waiting time meets each robot's deadline; throughput maximization across robots is not automatically compatible with a tight control period.\n\n## Make the action contract explicit\n\nThe [openpi remote-inference documentation](https://github.com/Physical-Intelligence/openpi/blob/main/docs/remote_inference.md) provides a concrete client/server boundary and returns action arrays with a horizon dimension. Study the observation transformation, image resize, normalization, and action convention together. Units, coordinate frames, joint ordering, and absolute-versus-delta semantics are part of correctness. A faster network path cannot repair a degrees-versus-radians error. Pin both client and server versions so a preprocessing change does not silently alter policy inputs.\n\nImplement an action envelope around every result: observation ID, capture timestamp, policy version, chunk start time, action period, coordinate frame, and validity interval. The consumer checks that envelope before admitting a chunk. Use a monotonic sequence number to reject out-of-order responses. Do not let a late older request replace a newer plan merely because it arrived last. Define behavior when no valid action remains using the controller's supported fallback; evaluate that behavior in simulation before physical integration.\n\n## Evaluate the closed loop\n\nMeasure the closed loop, not just the server. Log observation age at each applied action, buffer underflows, deadline-miss rate, chunk-boundary discontinuity, completion time, and task success. For a position-command sequence, a simple diagnostic is $\\|a_t-a_{t-1}\\|$ at handoffs compared with within-chunk values. It is not a universal smoothness metric: velocity, acceleration, and task-specific constraints may matter more. Aggregate averages can hide a few catastrophic pauses, so inspect the entire timing trace and worst supported conditions.\n\nThe supplied freshness simulator is a safe CPU starting point for scheduling concepts; it is not a pretrained VLA or a physical control loop. Extend it with a fixed-rate action consumer, finite action chunks, variable inference delay, and an explicit fallback event. Compare blocking, naive asynchronous splicing, and temporally aligned replacement. Then evaluate on a recorded or simulated closed-loop task with disturbances. Replaying observations alone can test timing but cannot establish closed-loop task success because actions no longer influence future observations. Your final report must state this boundary clearly and demonstrate both a deadline failure and a recovered operating region.",
+    "exercises": [
+      {
+        "title": "Reserve enough action ticks",
+        "prompt": "A 25 Hz controller receives policy chunks with p99 delivery latency 260 ms. How many ticks cover that delay, and how many cover it with two ticks of extra margin?",
+        "hint": "The control period is 40 ms; round upward.",
+        "solution": "ceil(260/40)=7 ticks cover 280 ms. Adding two ticks gives 9 ticks, covering 360 ms. This budgets scheduling slack but does not prove the policy remains accurate for that open-loop duration."
+      },
+      {
+        "title": "Align a delayed chunk",
+        "prompt": "A 20-step chunk with 20 ms spacing is timestamped to begin at 1000 ms and arrives at 1120 ms. Under a strict time-index interpretation, which index is current and how many elements remain including it?",
+        "hint": "Index zero corresponds to 1000 ms.",
+        "solution": "Elapsed=120 ms=6 ticks, so index 6 is current and 20−6=14 elements remain. This arithmetic alone does not justify execution: check actual executed actions and state compatibility before using the suffix."
+      },
+      {
+        "title": "Separate replay from closed-loop evidence",
+        "prompt": "A recorded-observation replay shows zero missed deadlines under a new scheduler. Can you claim robot success improved? Design the missing experiment.",
+        "hint": "In replay, actions cannot change subsequent observations.",
+        "solution": "No. Replay establishes timing behavior on that fixed trace. Run matched simulated episodes with actions feeding the environment, held-out initial states and disturbances, identical policy weights, and repeated seeds. Report success, completion time, action age, and failures. Use paired episodes when appropriate."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "A 50 Hz control loop and 160 ms policy latency imply a delay of:",
+        "options": [
+          "2 ticks",
+          "4 ticks",
+          "8 ticks",
+          "50 ticks"
+        ],
+        "answer": 2,
+        "explanation": "A 50 Hz loop has a period of 1000/50 = 20 ms. A 160 ms inference spans eight control ticks, which must be covered by valid actions or an explicitly defined fallback."
+      },
+      {
+        "question": "What must happen when an older response arrives after a newer plan?",
+        "options": [
+          "Reject it or reconcile explicitly using timestamps and generation IDs",
+          "Always replace the plan",
+          "Append it at the end blindly",
+          "Ignore observation time"
+        ],
+        "answer": 0,
+        "explanation": "A later arrival may have been computed from an older observation and correspond to expired action times. Sequence IDs and timestamps let the consumer reject or explicitly reconcile it instead of overwriting a newer plan."
+      },
+      {
+        "question": "Which evidence establishes closed-loop task performance?",
+        "options": [
+          "Recorded images processed quickly",
+          "High action tokens/s",
+          "A low average server latency",
+          "Episodes where applied actions influence future observations"
+        ],
+        "answer": 3,
+        "explanation": "Closed-loop evaluation requires applied actions to influence the environment and therefore the next observations. Recorded-observation replay can establish timing behavior but cannot demonstrate resulting task success."
+      },
+      {
+        "question": "Why is action chunking not a complete latency solution?",
+        "options": [
+          "Chunks cannot contain multiple actions",
+          "Actions can be based on old observations or misaligned at handoffs",
+          "It eliminates asynchronous work",
+          "It fixes all network delay"
+        ],
+        "answer": 1,
+        "explanation": "An action horizon provides scheduling slack but does not guarantee that its actions remain valid as the world changes. Delayed or incompatible chunks can still create stale feedback and discontinuous handoffs."
+      },
+      {
+        "question": "Which optimization requires action-quality validation?",
+        "options": [
+          "Adding timestamps",
+          "Recording a policy version",
+          "Reducing flow/denoising inference steps",
+          "Checking units"
+        ],
+        "answer": 2,
+        "explanation": "Reducing denoising or flow-solver steps changes the approximation used to generate the action chunk. The latency reduction must therefore be evaluated together with action quality and closed-loop task outcomes."
+      }
+    ],
+    "resources": [
+      {
+        "title": "Real-Time Execution of Action Chunking Flow Policies",
+        "url": "https://www.pi.website/download/real_time_chunking.pdf",
+        "type": "Paper",
+        "why": "Study committed actions, asynchronous generation, and delay-sensitive evaluation.",
+        "required": true
+      },
+      {
+        "title": "openpi remote inference",
+        "url": "https://github.com/Physical-Intelligence/openpi/blob/main/docs/remote_inference.md",
+        "type": "Documentation",
+        "why": "Trace the concrete observation and action-chunk client/server contract.",
+        "required": true
+      },
+      {
+        "title": "openpi",
+        "url": "https://github.com/Physical-Intelligence/openpi",
+        "type": "Repository",
+        "why": "Inspect policy examples, normalization, and model-specific action semantics.",
+        "required": false
+      },
+      {
+        "title": "Real-Time Action Chunking: author explanation and demos",
+        "url": "https://www.pi.website/research/real_time_chunking",
+        "type": "Video",
+        "why": "Watch the chunk-boundary failure demonstrations and the visual explanation of committed actions.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "A deadline-aware action consumer",
+      "path": "labs/08_freshness.py",
+      "command": "python3 labs/08_freshness.py",
+      "task": "Extend the CPU freshness simulation with action chunks, a fixed-rate consumer, jitter, timestamp checks, and fallback events. Closed-loop simulation is a separate extension.",
+      "success": "Measure action age and underflow, catch out-of-order chunks, and distinguish replay timing from task success."
+    },
+    "completion": [
+      "Observation/action timestamps and units verified.",
+      "Jitter and late-result tests with explicit fallback.",
+      "Closed-loop evaluation protocol and temporal handoff analysis."
+    ]
+  },
+  {
+    "id": "23",
+    "slug": "reproducible-inference-experiments",
+    "title": "Make the result survive another machine",
+    "subtitle": "A benchmark is an argument with executable evidence.",
+    "phase": 7,
+    "week": 23,
+    "minutes": 35,
+    "level": "Research",
+    "hardware": "CPU",
+    "tags": [
+      "Experiment design",
+      "Statistics",
+      "Reproduction"
+    ],
+    "outcomes": [
+      "Write a falsifiable hypothesis and identify confounders.",
+      "Measure throughput and tail latency without changing offered load.",
+      "Package repeated-run evidence with uncertainty and an honest scope."
+    ],
+    "body": "A speedup is a ratio, and almost every term in that ratio can be accidentally changed. The model revision, tokenizer, prompt mix, output length, cache state, power limit, compiler, precision, batching, and measurement boundary can all move the result. Systems research begins by making the comparison interpretable. Your goal this week is an experiment that another engineer can rerun, criticize, and extend without asking what the numbers meant.\n\n## State the claim and its success contract\n\nWrite the claim before the code. For example: “At fixed hardware and quality, our policy increases requests completed within TTFT ≤ 1 s and p95 per-request inter-token gap ≤ 80 ms on held-out bursty traces.” Define whether every token gap or a per-request statistic enters eligibility. Define how cancelled, rejected, and timed-out requests count. These choices are part of the objective; changing them after seeing results is changing the question.\n\nUse an explicit goodput estimator:\n\n$$G=\\frac{\\sum_{i=1}^{N}\\mathbf{1}[\\text{request }i\\text{ meets the declared contract}]}{T_{measurement}}.$$\n\n## Keep offered load independent of server speed\n\nKeep the offered trace fixed across variants. In an open-loop load generator, request arrivals follow the trace independently of responses. In a closed-loop generator, a client often waits for a response before sending its next request, so a slower server receives fewer arrivals. That can conceal overload and distort latency comparisons. Closed-loop testing is valid for workloads that actually behave that way, but it answers a different question. Record scheduled arrival time and actual send time to detect generator bottlenecks.\n\nA simple example shows the danger. Variant A takes one second per request and variant B takes two. Ten closed-loop clients offer roughly ten requests/s to A but only five to B at saturation. Comparing their latency distributions as if both saw ten requests/s is false. An open-loop trace at ten requests/s exposes B's backlog. If the generator itself cannot send on time, measure delay from scheduled arrival or explicitly report the missed arrivals instead of silently resetting the clock when the send finally occurs.\n\n## Separate warmup, execution, and instrumentation\n\nSeparate cold start, warm steady state, and cache-assisted service. Compilation, model loading, graph capture, allocator growth, and network setup belong to cold-start measurements when deployment requires them. They should not be mixed into a steady-state kernel median by accident. Conversely, an always-warm microbenchmark does not establish autoscaling recovery time. The [PyTorch benchmark recipe](https://docs.pytorch.org/tutorials/recipes/recipes/benchmark) explains warmup-aware repeated timing; use runtime-aware timers and verify synchronization for your measurement scope.\n\nFor GPU microbenchmarks, ensure work completion is included. For end-to-end throughput, avoid placing a device synchronization after every operator because that destroys the overlap you intend to measure. Profile a diagnostic run separately from the timing run and quantify instrumentation overhead. Record device model, memory, topology, driver/runtime, compiler, power settings, and software commits. The [PyTorch reproducibility notes](https://docs.pytorch.org/docs/2.14/notes/randomness.html) distinguish seeding from stronger reproducibility guarantees; state the actual numerical contract instead of promising cross-platform bitwise identity.\n\n## Match uncertainty to independent evidence\n\nRepeat independent runs and preserve per-request records. A million correlated requests from one run are not a million independent experiments. Cache warmup, thermal drift, workload phases, and shared failures create dependence. Alternate or randomize variant order; pair runs on the same trace; summarize run-level differences. If you bootstrap, resample independent runs or defensible workload blocks rather than pretending every adjacent token latency is independent. Show the interval and method, not only a mean speedup.\n\nTail estimates need enough evidence. With 100 observations, p99 is determined by approximately the largest one or two values depending on the quantile convention. That is unstable evidence for a rare-tail claim. If zero failures occur in 100 independent trials, the approximate 95% upper bound from the rule of three is 3%, not zero. More generally, the exact one-sided zero-failure bound solves $(1-p)^n=0.05$, giving $p=1-0.05^{1/n}$. Report sample counts and independence assumptions alongside tail metrics.\n\n## Use ablations and honest aggregation\n\nUse ablations to connect the improvement to a mechanism. Compare baseline, feature A, feature B, and A+B under the same workload and tuning budget. If A+B improves but neither alone does, investigate interaction rather than attributing the whole gain to the feature you prefer. Also vary the parameter that should control the effect: cache reuse for prefix caching, acceptance for speculation, skew for expert placement, or service delay for freshness scheduling. A predicted trend that fails is valuable evidence against your explanation.\n\nAggregate speedups carefully. If a baseline takes 1 ms on one shape and 100 ms on another, while a variant takes 0.5 ms and 110 ms, its per-shape speedups are 2 and about 0.91. Yet processing one of each takes 110.5 ms instead of 101 ms, so the workload slows down. An unweighted average of ratios answers a different question from total workload time. Publish the workload weights and report both per-shape results and the aggregate metric that matches deployment.\n\n## Package the evidence for another engineer\n\nThe [OSDI artifact guidance](https://www.usenix.org/conference/osdi24/call-for-artifacts) is a useful standard for making evidence inspectable. Package commands, environment details, raw data, correctness checks, plotting code, and expected qualitative results. Include a low-cost smoke test and a full-run budget. Use the course experiment template for one earlier lab and reproduce a result from a clean directory. The week's deliverable is not a flattering chart: it is a defensible claim with a baseline, uncertainty, a counterexample, and enough executable detail that someone else can discover your mistake if you made one.",
+    "exercises": [
+      {
+        "title": "Compute a failure bound",
+        "prompt": "You observe zero failures in 200 independent trials. Give the rule-of-three estimate and exact one-sided 95% upper bound.",
+        "hint": "Use 3/n and 1−0.05^(1/n).",
+        "solution": "Rule of three gives 3/200=1.5%. Exact bound is 1−0.05^(1/200)≈1.487%. Zero observed failures does not prove zero risk; dependence between trials would weaken this calculation."
+      },
+      {
+        "title": "Unmask a throughput comparison",
+        "prompt": "A baseline has 1000 offered requests and 700 SLO successes in 100 s. A variant has 600 offered and 540 successes in 100 s. Which has higher measured goodput, and is the architectural comparison fair?",
+        "hint": "Goodput uses qualifying completions; fairness also requires matched offered workload.",
+        "solution": "Baseline goodput=7/s, variant=5.4/s. Variant has higher success fraction (90% vs 70%) but lower measured goodput. Because offered loads differ, this does not establish a fair capacity comparison; rerun the same trace and sweep matched offered rates."
+      },
+      {
+        "title": "Design a four-way ablation",
+        "prompt": "An engine changes chunked prefill and prefix caching together and improves latency. Design the minimum factorial comparison.",
+        "hint": "Use the two features as binary factors.",
+        "solution": "Run neither, chunking only, caching only, and both, with identical model, resources, offered trace, cache initialization, and tuning budget. Repeat run order randomly. Measure mechanism-specific counters: prefill interruption/gaps and reused token counts, then test whether the combined effect is additive or interactive."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Why can closed-loop generation conceal overload?",
+        "options": [
+          "It always sends infinite traffic",
+          "Slow responses reduce subsequent offered arrivals",
+          "It removes all queueing",
+          "It is identical to open-loop replay"
+        ],
+        "answer": 1,
+        "explanation": "When clients wait for responses before sending more work, a slower server automatically receives fewer new requests. That feedback can hide the queue growth that a fixed external arrival process would produce."
+      },
+      {
+        "question": "Zero failures in 100 independent trials implies approximately what 95% upper bound?",
+        "options": [
+          "Exactly zero",
+          "50%",
+          "3%",
+          "0.001%"
+        ],
+        "answer": 2,
+        "explanation": "The rule of three estimates a one-sided 95% upper failure-probability bound of 3/n. With n=100 independent trials it is about 3%, so zero observed failures does not establish a zero failure probability."
+      },
+      {
+        "question": "What is a strong unit for resampling repeated correlated workloads?",
+        "options": [
+          "Every adjacent token as independent",
+          "Only the fastest run",
+          "Only successful requests",
+          "Independent runs or defensible blocks"
+        ],
+        "answer": 3,
+        "explanation": "Adjacent requests can share cache state, thermal conditions, bursts, and failures. Resampling independent runs or justified blocks preserves more of that dependence than treating every token as an independent trial."
+      },
+      {
+        "question": "What should a profiling run establish before its timing is used?",
+        "options": [
+          "Instrumentation overhead is understood and does not invalidate the comparison",
+          "More trace events always mean more speed",
+          "Synchronization is always harmless",
+          "Only GPU time matters"
+        ],
+        "answer": 0,
+        "explanation": "Profilers and forced synchronization can change execution order, overhead, and overlap. Establish their effect and use a separate timing run when needed so the measured system matches the claimed operating mode."
+      },
+      {
+        "question": "Which artifact best supports reproducibility?",
+        "options": [
+          "A screenshot of a chart",
+          "Pinned code, raw data, commands, environment, correctness checks, and plots",
+          "A rounded speedup in a README",
+          "Only a container tag called latest"
+        ],
+        "answer": 1,
+        "explanation": "Reproducibility requires an executable chain from a pinned environment and inputs through correctness checks to raw measurements and figures. A screenshot or an unversioned latest tag cannot supply that chain."
+      }
+    ],
+    "resources": [
+      {
+        "title": "PyTorch benchmark recipe",
+        "url": "https://docs.pytorch.org/tutorials/recipes/recipes/benchmark",
+        "type": "Documentation",
+        "why": "Use warmup-aware timers and repeated measurements.",
+        "required": true
+      },
+      {
+        "title": "PyTorch reproducibility notes",
+        "url": "https://docs.pytorch.org/docs/2.14/notes/randomness.html",
+        "type": "Documentation",
+        "why": "Define what seeding and deterministic execution do and do not guarantee.",
+        "required": true
+      },
+      {
+        "title": "OSDI artifact evaluation guidance",
+        "url": "https://www.usenix.org/conference/osdi24/call-for-artifacts",
+        "type": "Documentation",
+        "why": "Use availability, functionality, and claim reproduction as an evidence standard.",
+        "required": true
+      },
+      {
+        "title": "Berkeley Scalable AI — Assignment 4: Applications (ZIP)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/assignment_4.zip",
+        "type": "Course",
+        "why": "Optional project reference: the actual handout asks for an interactive application, a justified serving stack, quality/performance evaluation, and a demo. Keep its original model restrictions distinct from this course.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Reproduce your own result",
+      "path": "docs/EXPERIMENT_TEMPLATE.md",
+      "command": "python3 labs/03_scheduler.py",
+      "task": "Choose an earlier lab, freeze a hypothesis and workload, repeat variants, and package raw data plus a clean-run reproduction procedure.",
+      "success": "A third party can identify the baseline, metric, uncertainty method, environment, and exact command for every reported figure."
+    },
+    "completion": [
+      "Hypothesis and metric definitions fixed before evaluation.",
+      "Independent repeats and uncertainty reported.",
+      "Clean-directory reproduction with raw artifacts."
+    ]
+  },
+  {
+    "id": "24",
+    "slug": "original-research-capstone",
+    "title": "Earn the right to make a new claim",
+    "subtitle": "One narrow mechanism, one strong baseline, one result that survives scrutiny.",
+    "phase": 7,
+    "week": 24,
+    "minutes": 35,
+    "level": "Research",
+    "hardware": "CPU",
+    "tags": [
+      "Capstone",
+      "Research",
+      "Technical writing"
+    ],
+    "outcomes": [
+      "Turn a bottleneck into a bounded original hypothesis.",
+      "Design a matched evaluation with ablations and failure regions.",
+      "Publish a reproducible research artifact with calibrated claims."
+    ],
+    "body": "Finishing a course does not place someone at the research frontier. Producing a result that changes what a competent engineer should do is a stronger test. Your capstone is therefore not “build a faster inference engine.” It is a narrow claim about a mechanism, workload, and constraint, supported by code and evidence. A negative result can pass if it explains a widely plausible idea's failure and rules out the obvious alternative explanations.\n\n## Choose a bottleneck you can actually test\n\nBegin with the bottleneck ledger you built throughout the course. Choose one observed limitation that is both consequential and experimentally accessible: expert placement chasing a changing distribution, speculation wasting work at high occupancy, visual-token budgets harming small-text quality, or stale observations dominating an otherwise fast VLA server. Avoid choosing a topic solely because its repository is new. You need a measurable causal story and enough resources to test it credibly.\n\nWrite a hypothesis with an intervention, mechanism, outcome, and boundary. For example: “A migration-budgeted expert placement policy improves p99 layer latency on phase-changing routing traces by avoiding replans whose predicted savings cannot repay movement cost.” The mechanism is a break-even rule; the outcome is measured latency; the boundary is a workload with changes on a comparable timescale. A static uniform trace should show little benefit, making it a useful control. CPU simulation can test the control logic, while a hardware latency claim requires actual movement and execution measurements.\n\n## Select one capstone track\n\nThree capstone tracks connect the course projects. The engine track studies one scheduler or cache policy in the small serving engine, with an established runtime as a reference where feasible. The distributed track studies dispatch, replication, or placement using the MoE lab and then a real multi-device implementation if available. The embodied track studies video/VLA freshness under strict deadlines, with a closed-loop simulator for action-performance claims. Choose one track deeply. Combining all three before proving any mechanism usually creates a large demo with an ambiguous conclusion.\n\n## Predict a break-even boundary\n\nDerive a prediction before running the main evaluation. Suppose your expert policy estimates migration cost $C_m$ and per-step saving $\\Delta t$. It should migrate only if the useful horizon $H$ satisfies\n\n$$H\\Delta t>C_m+M,$$\n\nwhere $M$ is a margin for estimation error. With $C_m=60$ ms, $\\Delta t=0.3$ ms, and $M=15$ ms, break-even requires more than 250 useful steps. Test around that boundary: 50, 150, 250, 500, and 1000-step phases. If the policy claims benefits equally everywhere, either the model is wrong or another implementation difference is driving the result. Both possibilities are worth investigating.\n\n## Set a fair baseline and correctness contract\n\nBuild a baseline ladder. Include the simplest reasonable policy, a well-tuned existing method, your proposal, and an oracle only when it clarifies the remaining opportunity. Give deployable variants equal resources and comparable tuning effort. The oracle can know future phase duration, but label that information advantage explicitly. Freeze training/calibration traces separately from evaluation traces. A controller tuned on the exact test phase sequence may simply memorize it, which is not workload adaptation.\n\nDefine correctness at the lowest relevant level and quality at the highest. A placement optimization preserves logical expert outputs; a speculative optimization preserves the stated sampling contract; a visual-token policy may intentionally approximate and must meet a held-out quality threshold; a VLA scheduler must preserve action units and timestamps while proving task success in a closed loop. “It ran without crashing” is an execution result, not a correctness or quality result.\n\n## Map the operating and failure regions\n\nCreate an evidence matrix crossing workload, stressor, and metric. For each configuration, record throughput or goodput, p50/p95/p99 latency where sample size supports them, memory, movement/transfer volume, quality, and failure outcomes. Add ablations that remove the mechanism's key ingredient. Include at least one regime where the proposal should lose: rapid phase changes, low draft acceptance, tiny requests, very slow links, or visually ambiguous scenes. A method with an explained failure boundary is more useful than one evaluated only on favorable conditions.\n\n## Write and defend a reproducible claim\n\nThe technical report should let a reader reconstruct the argument without browsing your chat history. Start with the concrete problem and result scope. Explain the baseline's bottleneck using a timeline or cost model, present the intervention and invariants, describe the experimental setup, then show results and competing explanations. Include a limitations section that states what was not measured. Use confidence labels deliberately: high for reproduced arithmetic and validated invariants, moderate for effects supported by repeated experiments on limited hardware, and unknown for untested deployment-scale generalization.\n\nPackage the repository so an outsider can reproduce a small result quickly. Provide a smoke command, a full evaluation command, estimated runtime and hardware requirements, pinned dependencies, raw results, plotting code, and checkpoint/data provenance. Avoid publishing private input traces; create a documented synthetic generator or redistributable subset with comparable workload statistics. Follow the [OSDI artifact guidance](https://www.usenix.org/conference/osdi24/call-for-artifacts) as a practical standard. For a DeepInfer-inspired project, cite the exact [source snapshot](https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9) and identify which production components were outside your reproduction.\n\nYour oral defense is five minutes: state the claim, derive why it should work, show the strongest evidence, explain the strongest counterexample, and name the next experiment that could overturn your conclusion. Passing requires a reviewer to understand both the contribution and its limits. The course ends when you can reason this way independently; frontier work continues through better questions, stronger baselines, and repeated contact with real workloads.",
+    "exercises": [
+      {
+        "title": "Make a vague claim falsifiable",
+        "prompt": "Rewrite “adaptive speculation is faster” as a testable capstone hypothesis with a predicted failure region.",
+        "hint": "Specify workload, resources, objective, intervention, and comparison.",
+        "solution": "Example: On fixed hardware and a held-out mixed-code/chat trace at matched offered load, an occupancy-aware draft-length controller improves SLO goodput over the best fixed draft length at equal quality and memory budget. Predict little benefit on stationary low-occupancy traffic and possible losses when controller overhead exceeds saved verification work. Fix thresholds and tuning budgets before testing."
+      },
+      {
+        "title": "Calculate a conservative migration gate",
+        "prompt": "A move costs 90 ms, saves an estimated 0.4 ms/step, and requires a 30 ms uncertainty margin. What horizon justifies migration? What if the phase lasts 200 steps?",
+        "hint": "Compare H×0.4 against 90+30.",
+        "solution": "Require H>300 useful steps. At 200 steps, predicted savings are 80 ms, below even the 90 ms raw cost, and 40 ms below the conservative threshold. The policy should not migrate under these assumptions."
+      },
+      {
+        "title": "Defend a negative result",
+        "prompt": "Your adaptive policy never beats a strong fixed baseline. Design a report that still establishes something useful.",
+        "hint": "Rule out implementation bugs and identify the missing opportunity.",
+        "solution": "Verify correctness, equal tuning and resources, and controller overhead. Compare to an oracle to measure possible headroom. If even the oracle barely helps, the workload offers little adaptation opportunity. If the oracle helps strongly, diagnose estimation delay or migration cost. Publish raw results, failure boundaries, and the specific conclusion supported; do not invent novelty or hide the baseline."
+      }
+    ],
+    "quiz": [
+      {
+        "question": "Which is the strongest capstone claim?",
+        "options": [
+          "Our system is state of the art",
+          "It uses a recent paper",
+          "A specified mechanism improves a declared metric on matched held-out workloads with measured limits",
+          "The demo looks responsive"
+        ],
+        "answer": 2,
+        "explanation": "A useful research claim specifies the intervention, comparison, workload, metric, and limits. That structure makes it possible to reproduce the result and identify evidence that would falsify it."
+      },
+      {
+        "question": "What role should a future-aware oracle play?",
+        "options": [
+          "An explicitly labeled upper-bound comparison",
+          "The only deployable baseline",
+          "A source of hidden test tuning",
+          "Proof that your controller is optimal"
+        ],
+        "answer": 0,
+        "explanation": "An oracle with future knowledge can estimate remaining opportunity, but its information advantage is not available to a deployable controller. Label it separately and compare practical methods under matched information."
+      },
+      {
+        "question": "When can a negative result be a successful capstone?",
+        "options": [
+          "When the baseline was intentionally weak",
+          "Only when no experiments run",
+          "When the report omits failures",
+          "When controlled evidence explains a mechanism’s limits and rules out obvious confounders"
+        ],
+        "answer": 3,
+        "explanation": "A controlled negative result can show that a plausible mechanism has little headroom or fails for a specific reason. Strong baselines, correctness checks, and ruled-out confounders make that boundary useful evidence."
+      },
+      {
+        "question": "A CPU simulation improves predicted work by 15%. What can you claim?",
+        "options": [
+          "GPU latency improves 15%",
+          "The specified model objective improved 15% under the simulated assumptions",
+          "Production cost falls 15%",
+          "Every workload improves"
+        ],
+        "answer": 1,
+        "explanation": "The observed result concerns the simulator’s objective and assumptions. Accelerator latency, network behavior, and production cost require additional measurements and cannot inherit the same percentage automatically."
+      },
+      {
+        "question": "What should the final defense name besides its strongest result?",
+        "options": [
+          "Only positive examples",
+          "A marketing slogan",
+          "The strongest counterexample and next falsifying experiment",
+          "An unmeasured scaling estimate as fact"
+        ],
+        "answer": 2,
+        "explanation": "A research defense must show where the method fails and which next experiment could overturn its explanation. Those boundaries make the claim usable and testable instead of merely persuasive."
+      }
+    ],
+    "resources": [
+      {
+        "title": "OSDI artifact evaluation guidance",
+        "url": "https://www.usenix.org/conference/osdi24/call-for-artifacts",
+        "type": "Documentation",
+        "why": "Use it to audit the completeness and reproducibility of the research package.",
+        "required": true
+      },
+      {
+        "title": "DeepInfer pinned source tree",
+        "url": "https://github.com/deepseek-ai/DeepInfer/tree/9bd9cf243fc53ef9afbf8f04d391d989117d6ab9",
+        "type": "Repository",
+        "why": "A concrete source baseline for advanced mechanisms; document the exact subset reproduced.",
+        "required": false
+      },
+      {
+        "title": "DistServe author presentation",
+        "url": "https://www.usenix.org/conference/osdi24/presentation/zhong-yinmin",
+        "type": "Video",
+        "why": "Study how a systems paper connects an objective, mechanism, and evaluation.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Assignment 4: Applications (ZIP)",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/assets/assignment_4.zip",
+        "type": "Course",
+        "why": "Optional project reference: the actual handout asks for an interactive application, a justified serving stack, quality/performance evaluation, and a demo. Keep its original model restrictions distinct from this course.",
+        "required": false
+      },
+      {
+        "title": "Berkeley Scalable AI — Spring 2026 archive",
+        "url": "https://scalable-ai.eecs.berkeley.edu/S2026/",
+        "type": "Course",
+        "why": "Original lecture, assignment, and student-project links. This independent course is not affiliated with Berkeley.",
+        "required": false
+      }
+    ],
+    "lab": {
+      "title": "Publish one defensible result",
+      "path": "docs/EXPERIMENT_TEMPLATE.md",
+      "command": "python3 labs/06_moe.py",
+      "task": "Choose one capstone track. Use a reference lab only as the starting point, implement your intervention, and publish a reproducible technical report with actual evidence.",
+      "success": "A reviewer can rerun the smoke test, inspect raw results, understand the baseline, and identify the claim’s failure boundary."
+    },
+    "completion": [
+      "Original bounded hypothesis with a strong matched baseline.",
+      "Correctness, quality, ablations, uncertainty, and a failure region.",
+      "Reproducible repository, technical report, and five-minute defense."
+    ]
+  }
+]
